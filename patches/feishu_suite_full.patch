@@ -1,0 +1,4045 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 241f094c31..66005725f2 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -448,7 +448,8 @@ _CONTROL_STATE: dict[str, Any] = {
+     "_interrupt_thread_signal_pending": False,
+     "_client_lock": threading.RLock,
+     "_model_request_active": threading.Event,
+-    "_supports_active_turn_redirect": True,
++    "_supports_active_turn_redirect": False,
++    # 豆花本机补丁 2026-11-06：禁用 active-turn redirect，发消息即硬打断另起一轮。
+     # /steer: the drain hook appends the note to the last tool result after the current
+     # batch — no interrupt, no new user turn (role alternation preserved).
+     "_pending_steer": None,
+diff --git a/gateway/cardkit_bridge.py b/gateway/cardkit_bridge.py
+new file mode 100644
+index 0000000000..47cc14cf54
+--- /dev/null
++++ b/gateway/cardkit_bridge.py
+@@ -0,0 +1,127 @@
++"""CardKit bridge (豆花本机补丁 2026-11-07).
++
++Problem: ``plugins/platforms/feishu/__init__.py`` does ``from .adapter import register``,
++so ANY ``from plugins.platforms.feishu import cardkit`` drags in adapter.py -> gateway.config
++-> ruamel etc. The gateway runs its own interpreter with ``-I`` (isolated), where those
++deps are NOT importable -> the import raises ModuleNotFoundError, which the hooks' bare
++``except: pass`` swallowed silently. Result: no card, no tool/answer tee (the real root
++cause of "输出内容并没有出现在该出现的位置").
++
++Fix: load cardkit.py BY FILE PATH via importlib, as a process-wide singleton, bypassing
++the package __init__ entirely. cardkit.py is pure stdlib, so this works in both the
++normal interpreter and the gateway's isolated one. All three hook sites import THIS
++module (a top-level gateway module with no heavy deps), guaranteeing one shared
++``_ACTIVE`` registry.
++"""
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++import threading
++from pathlib import Path
++
++_MOD_NAME = "_hermes_cardkit_stream"
++_PATH = (Path(__file__).resolve().parent.parent
++         / "plugins" / "platforms" / "feishu" / "cardkit.py")
++_LOCK = threading.Lock()
++_MOD = None
++
++
++def _load():
++    global _MOD
++    if _MOD is not None:
++        return _MOD
++    with _LOCK:
++        if _MOD is not None:
++            return _MOD
++        # Reuse an already-loaded module if present (e.g. normal import elsewhere).
++        existing = sys.modules.get(_MOD_NAME)
++        if existing is not None:
++            _MOD = existing
++            return _MOD
++        spec = importlib.util.spec_from_file_location(_MOD_NAME, str(_PATH))
++        if spec is None or spec.loader is None:
++            return None
++        mod = importlib.util.module_from_spec(spec)
++        sys.modules[_MOD_NAME] = mod
++        try:
++            spec.loader.exec_module(mod)
++        except Exception:
++            sys.modules.pop(_MOD_NAME, None)
++            return None
++        _MOD = mod
++        return _MOD
++
++
++def get():
++    """Return the cardkit module (singleton), or None if it could not load.
++    Never raises: callers must degrade to their original path on None."""
++    try:
++        return _load()
++    except Exception:
++        return None
++
++
++# Convenience proxies so hook sites stay one-liners. Each returns a safe default
++# on any failure, matching the "never break the gateway run" contract.
++def ensure(chat_id, *, reply_to=None, thread_id=None, session_key=None,
++           title=None, title_hint=None, model=None, reasoning_effort=None):
++    m = get()
++    if m is None:
++        return None
++    try:
++        return m.ensure(chat_id, reply_to=reply_to, thread_id=thread_id,
++                        session_key=session_key, title=title,
++                        title_hint=title_hint, model=model,
++                        reasoning_effort=reasoning_effort)
++    except Exception:
++        return None
++
++
++def on_send(chat_id, content, *, reply_to=None, thread_id=None, session_key=None,
++            is_final=False):
++    m = get()
++    if m is None:
++        return None
++    try:
++        return m.on_send(chat_id, content, reply_to=reply_to,
++                         thread_id=thread_id, session_key=session_key,
++                         is_final=is_final)
++    except Exception:
++        return None
++
++
++def on_edit(chat_id, content, *, finalize=False, is_turn_final=False,
++            message_id=None, thread_id=None, session_key=None):
++    m = get()
++    if m is None:
++        return False
++    try:
++        return m.on_edit(chat_id, content, finalize=finalize,
++                         is_turn_final=is_turn_final, message_id=message_id,
++                         thread_id=thread_id, session_key=session_key)
++    except Exception:
++        return False
++
++
++def on_tool(chat_id, line, *, thread_id=None, session_key=None, args=None, preview=None):
++    m = get()
++    if m is None:
++        return False
++    try:
++        return bool(m.on_tool(chat_id, line, thread_id=thread_id,
++                              session_key=session_key, args=args, preview=preview))
++    except Exception:
++        return False
++
++
++def on_thinking(chat_id, text, *, thread_id=None, session_key=None):
++    m = get()
++    if m is None:
++        return False
++    try:
++        return bool(m.on_thinking(chat_id, text, thread_id=thread_id,
++                                  session_key=session_key))
++    except Exception:
++        return False
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index 2391ba5941..7d1393e576 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
+ import asyncio
+ import concurrent.futures
+ import dataclasses
++import inspect
+ import json
+ import os
+ import re
+@@ -863,6 +864,26 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
+     async def _hm_cmd_new(self, event, source, _quick_key):
+         if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+             return True, self._telegram_topic_root_new_message()
++
++        # 豆花本机补丁 2026-11-07：飞书平台裸 /new 弹出交互式新建话题表单卡片
++        _plat = str(getattr(getattr(source, "platform", None), "value", getattr(source, "platform", "")) or "").lower()
++        if "feishu" in _plat and not event.get_command_args().strip():
++            try:
++                from plugins.platforms.feishu.cardkit import enabled as ck_enabled
++                if ck_enabled():
++                    adapter_fn = getattr(self, "_delivery_adapter_for", None)
++                    adapter = adapter_fn(source) if callable(adapter_fn) else None
++                    send_picker = getattr(adapter, "send_new_topic_picker", None) if adapter is not None else None
++                    if callable(send_picker):
++                        # 渠道/模型/思考等级全部取真实运行时值，卡片自己读实时目录（不阻塞事件循环）。
++                        res = send_picker(chat_id=source.chat_id,
++                                          metadata={"thread_reply": False})
++                        if inspect.isawaitable(res):
++                            await res
++                        return True, ""
++            except Exception as exc:
++                logger.warning("[Feishu] /new popup card failed: %s", exc, exc_info=True)
++
+         return await self._hm_confirm_destructive(
+             event, "new", t("gateway.confirm.detail_new"),
+             self._handle_reset_command,
+diff --git a/gateway/run_turn_progress.py b/gateway/run_turn_progress.py
+index c62873173d..c312a0e969 100644
+--- a/gateway/run_turn_progress.py
++++ b/gateway/run_turn_progress.py
+@@ -167,6 +167,21 @@ class GatewayTurnProgressMixin:
+             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+             preview_str = f' "{preview}"' if preview else ""
+             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
++        # 豆花本机补丁 2026-11-07 修：CardKit 工具 tee 必须在 progress_queue guard 之前。
++        # 飞书 tool_progress=false → needs_progress_queue=False → ctx.progress_queue 为 None，
++        # 原实现把 tee 放在 guard 之后，on_tool 从不执行，「工具调用」折叠框永远空。
++        # 卡片是独立于聊天气泡的目的地，与上面的 log_queue 段同理，不该受 progress_queue 约束。
++        if (event_type == "tool.started" and tool_name and tool_name != "_thinking"
++                and ctx._run_still_current()):
++            try:
++                from gateway import cardkit_bridge as _ck
++                if _ck.on_tool(getattr(ctx.source, "chat_id", ""), str(tool_name),
++                               thread_id=getattr(ctx.source, "thread_id", None),
++                               session_key=getattr(ctx, "session_key", None),
++                               args=args, preview=preview):
++                    return
++            except Exception:
++                pass
+         if not ctx.progress_queue or not ctx._run_still_current():
+             return
+         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 1b66830294..b55db4cbc8 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -482,6 +482,28 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
+             self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
+         agent.reasoning_callback = None  # per turn: a reused agent never keeps an earlier API turn's sink
++        # 豆花本机补丁 2026-11-07：飞书 CardKit「思考过程」折叠框接真实 reasoning/<think> 流式增量。
++        # 只注册转发回调，不改 API 请求参数（wants_reasoning 仅决定是否解析流内 reasoning 事件）。
++        # local_viewer_events.wire() 只对 Platform.LOCAL 生效，飞书路径不会被覆盖。
++        _plat = str(getattr(getattr(ctx.source, "platform", None), "value",
++                            getattr(ctx.source, "platform", "")) or "").lower()
++        if "feishu" in _plat:
++            try:
++                from gateway import cardkit_bridge as _ck
++                if _ck.get() is not None:
++                    _chat = getattr(ctx.source, "chat_id", "") or ""
++                    _thread = getattr(ctx.source, "thread_id", None)
++                    _skey = getattr(ctx, "session_key", None)
++
++                    def _ck_reasoning(text, _chat=_chat, _thread=_thread,
++                                      _skey=_skey, _ck=_ck):
++                        if text:
++                            _ck.on_thinking(_chat, str(text), thread_id=_thread,
++                                            session_key=_skey)
++
++                    agent.reasoning_callback = _ck_reasoning
++            except Exception:
++                pass
+         if self._approval_owner is not None:
+             from gateway.session_api_turn import api_execution, wire_api_observers
+             if api_execution.get() is not None:
+@@ -1338,6 +1360,26 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+                 runner._service_tier = tier
+         runner._reasoning_config = reasoning_config
+         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
++        # 豆花本机补丁 2026-11-06：每轮开一张 CardKit 卡（门控 FEISHU_CARDKIT）。
++        try:
++            # 2026-11-07 修：网关用 python -I 隔离解释器，gateway.config 依赖 ruamel 不在 path，
++            # 原 `from gateway.config import Platform` 必抛 ModuleNotFoundError 被 except 静默吞掉，
++            # 导致 ensure() 从未执行 -> 卡片从未创建 -> 思考/工具/正文三块全部回落成卡外独立消息。
++            # 改用本函数已有的 platform_key / ctx.source.platform，零重依赖。
++            _plat_key = str(platform_key or "").lower()
++            _plat_src = str(getattr(getattr(ctx.source, "platform", None), "value",
++                                    getattr(ctx.source, "platform", "")) or "").lower()
++            if "feishu" in (_plat_key, _plat_src):
++                from gateway import cardkit_bridge as _ck
++                _ck_effort = (reasoning_config or {}).get("effort", "") if reasoning_config else ""
++                _ck.ensure(ctx.source.chat_id, reply_to=ctx.event_message_id,
++                          thread_id=getattr(ctx.source, "thread_id", None),
++                          session_key=getattr(ctx, "session_key", None),
++                          title_hint=getattr(ctx, "message", None),
++                          model=model,
++                          reasoning_effort=_ck_effort or None)
++        except Exception:
++            pass
+         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+         agent, reused_cached_agent = self._resolve_turn_agent(
+             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
+diff --git a/gateway/stream_consumer_transport.py b/gateway/stream_consumer_transport.py
+index 3be6b06a52..71b1716f93 100644
+--- a/gateway/stream_consumer_transport.py
++++ b/gateway/stream_consumer_transport.py
+@@ -28,7 +28,8 @@ class StreamTransportMixin:
+ 
+     _MIN_NEW_MSG_CHARS = 4
+ 
+-    async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
++    async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False,
++                            is_turn_final: bool = False):
+         """Edit via the adapter, passing routing metadata when supported."""
+         # Contract: adapters must accept finalize= even when False (test-guarded).
+         kwargs = dict(chat_id=self.chat_id, message_id=message_id, content=content,
+@@ -41,6 +42,16 @@ class StreamTransportMixin:
+                     kwargs["metadata"] = self.metadata
+             except (TypeError, ValueError):
+                 pass
++        # 豆花本机补丁 2026-11-07：只有真正回合结束才把 is_turn_final 透给支持它的 adapter
++        # （飞书 CardKit 用它区分「段落封版」和「封卡」）。用 signature 探测，其它 adapter 零影响。
++        if is_turn_final:
++            try:
++                params = inspect.signature(self.adapter.edit_message).parameters
++                if "is_turn_final" in params or any(
++                    param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
++                    kwargs["is_turn_final"] = True
++            except (TypeError, ValueError):
++                pass
+         return await self.adapter.edit_message(**kwargs)
+ 
+     async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
+@@ -495,7 +506,8 @@ class StreamTransportMixin:
+         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
+             return True
+         result = await self._edit_message(message_id=self._message_id, content=text,
+-                                          finalize=finalize)
++                                          finalize=finalize,
++                                          is_turn_final=is_turn_final)
+         if not result.success:
+             return await self._on_edit_failure(result, text, finalize=finalize,
+                                                is_turn_final=is_turn_final)
+diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
+index 3d8d67a6ac..0bc6dfee46 100644
+--- a/plugins/platforms/feishu/adapter.py
++++ b/plugins/platforms/feishu/adapter.py
+@@ -323,6 +323,7 @@ class FeishuAdapterSettings:
+     allow_bots: str = "none"  # "none" | "mentions" | "all"
+     require_mention: bool = True
+     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
++    thread_reply: bool = False  # group-chat replies answer inside a Feishu topic (reply_in_thread)
+ 
+ 
+ @dataclass
+@@ -1326,6 +1327,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+         self._card_action_tokens: dict[str, float] = {}  # token → first_seen_time
+         # Inbound events that arrived before the loop was ready; one drainer thread replays them.
+         self._pending_inbound_events: list[Any] = []
++        # 豆花补丁：DM 话题回复的锚点缓存（chat_id → 最近入站 message_id）
++        self._last_inbound_message_id: dict[str, str] = {}
+         self._pending_inbound_lock = threading.Lock()
+         self._pending_drain_scheduled = False
+         self._pending_inbound_max_depth = 1000  # cap queue; drop oldest beyond
+@@ -1420,6 +1423,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
+             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
+             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
++            thread_reply=_to_boolean(extra.get("thread_reply", _get_scoped_secret("FEISHU_THREAD_REPLY", "false"))),
+         )
+ 
+     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
+@@ -1660,6 +1664,20 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+         if not self._client:
+             return SendResult(success=False, error="Not connected")
+ 
++        # 豆花本机补丁 2026-11-06：最终答复写进 CardKit 卡片正文。
++        try:
++            from gateway import cardkit_bridge as _ck
++            _mid = _ck.on_send(chat_id, content, reply_to=reply_to,
++                               thread_id=(metadata or {}).get("thread_id"),
++                               session_key=(metadata or {}).get("session_key"),
++                               # 2026-11-07：gateway 的 _metadata_for_send(final=True)
++                               # 会置 notify；中间播报/预览不带 → 不覆盖卡片正文。
++                               is_final=bool((metadata or {}).get("notify")))
++            if _mid:
++                return SendResult(success=True, message_id=_mid)
++        except Exception:
++            pass
++
+         formatted = self.format_message(content)
+         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+         # Decide markdown-vs-text once for the whole message: a chunk of a long
+@@ -1705,11 +1723,21 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
+             return SendResult(success=False, error=str(exc))
+ 
+-    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
++    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
++                           is_turn_final: bool = False) -> SendResult:
+         """Edit a previously sent Feishu text/post message."""
+         if not self._client:
+             return SendResult(success=False, error="Not connected")
+ 
++        # 豆花本机补丁 2026-11-06：累积全量文本写进卡片正文。
++        try:
++            from gateway import cardkit_bridge as _ck
++            if _ck.on_edit(chat_id, content, finalize=finalize,
++                           is_turn_final=is_turn_final, message_id=message_id):
++                return SendResult(success=True, message_id=message_id)
++        except Exception:
++            pass
++
+         content = self.format_message(content)
+ 
+         async def _update(msg_type: str, payload: str) -> SendResult:
+@@ -2210,6 +2238,29 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+         event = getattr(data, "event", None)
+         action = getattr(event, "action", None)
+         action_value = getattr(action, "value", {}) or {}
++        # 豆花本机补丁 2026-11-08：飞书**表单提交**时 action.value 常为空，真实数据在
++        # action.form_value。必须在普通按钮路由之前拦截，否则会被转成 `/card` 合成命令，
++        # 网关报 `Unrecognized slash command /card`，提交静默丢失。
++        _fv = getattr(action, "form_value", None)
++        _btn = str(getattr(action, "name", "") or "").lower()
++        _looks_submit = ("submit" in _btn or "new" in _btn or "model" in _btn
++                         or "topic" in _btn or "switch" in _btn)
++        if isinstance(_fv, dict) and (_fv or _looks_submit):
++            return self._handle_feishu_form_card_action(
++                event=event,
++                action_value=action_value if isinstance(action_value, dict) else {},
++                loop=loop, form_value=_fv,
++            )
++        # 诊断（2026-11-08）：没被表单分支接住时，把 action/event 的真实字段名打出来。
++        # 飞书 SDK 版本不同 form 字段可能换名，有这条日志就不用再猜。
++        try:
++            if str(getattr(action, "tag", "") or "").lower() == "button":
++                logger.info("[Feishu] Unrouted button action: action_attrs=%r value_type=%s event_attrs=%r",
++                            sorted(vars(action)) if hasattr(action, "__dict__") else repr(action)[:200],
++                            type(getattr(action, "value", None)).__name__,
++                            sorted(vars(event)) if hasattr(event, "__dict__") else repr(event)[:200])
++        except Exception:
++            pass
+         for key, handler in self._CARD_ACTION_ROUTES if isinstance(action_value, dict) else ():
+             if action_value.get(key):
+                 return getattr(self, handler)(event=event, action_value=action_value, loop=loop)
+@@ -2510,10 +2561,12 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+ 
+     async def _dispatch_synthetic_event(
+         self, *, text: str, message_type: MessageType, chat_id: str, sender_id: Any, event_chat_type: str,
+-        raw_message: Any, message_id: str,
++        raw_message: Any, message_id: str, thread_id: Optional[str] = None,
+     ) -> None:
+         """Wrap a reaction/card click as a MessageEvent and run it through the guarded pipeline."""
+-        sender_profile = await self._resolve_sender_profile(sender_id)
++        sender_profile = (await self._resolve_sender_profile(sender_id)
++                          if sender_id is not None
++                          else {"user_id": "", "user_name": "User", "user_id_alt": None})
+         chat_info = await self.get_chat_info(chat_id)
+         source = self.build_source(
+             chat_id=chat_id,
+@@ -2521,7 +2574,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=event_chat_type),
+             user_id=sender_profile["user_id"],
+             user_name=sender_profile["user_name"],
+-            thread_id=None,
++            thread_id=thread_id,
+             user_id_alt=sender_profile["user_id_alt"],
+         )
+         synthetic_event = MessageEvent(
+@@ -2677,6 +2730,12 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+             or getattr(sender_id, "union_id", None) or "<unknown>"
+         )
+         chat_id = getattr(message, "chat_id", "") or ""
++        # 豆花补丁：记录最近入站 message_id，供 DM 话题回复作锚点
++        # key = (chat_id, thread_id or "") 避免同一 DM 下不同话题共用同一 anchor，导致图片串话题
++        if message_id and chat_id:
++            if not hasattr(self, "_last_inbound_message_id"):
++                self._last_inbound_message_id = {}
++            self._last_inbound_message_id[(chat_id, thread_id or "")] = message_id
+         logger.info(
+             "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s sender=%s:%s text=%r media=%d",
+             "dm" if chat_type == "p2p" else "group", message_id, inbound_type.value, chat_id,
+@@ -3731,7 +3790,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+                 payload = json.dumps(key_payload, ensure_ascii=False)
+                 thread_msg_id = (metadata or {}).get("reply_to_message_id")
+                 if not thread_msg_id:
+-                    thread_msg_id = await self._fetch_last_message_in_thread((metadata or {}).get("thread_id"))
++                    from plugins.platforms.feishu.feishu_thread_reply import fetch_last_message_in_thread
++                    thread_msg_id = await fetch_last_message_in_thread(self, (metadata or {}).get("thread_id"))
+                 if thread_msg_id:
+                     logger.info("[Feishu] Audio: retrying via reply API in thread")
+                     message_response = await self._feishu_send_with_retry(
+@@ -3781,14 +3841,23 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+     async def _send_raw_message(
+         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
+     ) -> Any:
++        from plugins.platforms.feishu.feishu_thread_reply import send_threaded_reply, wants_thread_reply
+         thread_id = (metadata or {}).get("thread_id")
+         effective_reply_to = reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None)
+-        if effective_reply_to:
+-            body = self._build_reply_message_body(
+-                content=payload, msg_type=msg_type, reply_in_thread=bool(thread_id), uuid_value=str(uuid.uuid4()),
++        # 豆花补丁：DM 主框消息无 reply_to 时，用缓存的入站 message_id 作锚点建话题
++        # 2026-11-08 修：若 metadata 明确要求 thread_reply=False（如 /new 配置卡），绝不自动锚定建话题！
++        wants_thread = (metadata or {}).get("thread_reply", True) is not False
++        if not effective_reply_to and wants_thread and await wants_thread_reply(self, chat_id):
++            anchor = (metadata or {}).get("message_id") or (metadata or {}).get("reply_to_message_id")
++            if not anchor:
++                anchor = getattr(self, "_last_inbound_message_id", {}).get((chat_id, thread_id or ""))
++            if anchor:
++                effective_reply_to = anchor
++        if effective_reply_to and wants_thread:
++            return await send_threaded_reply(
++                self, chat_id=chat_id, msg_type=msg_type, payload=payload,
++                reply_to=effective_reply_to, metadata=metadata,
+             )
+-            request = self._build_reply_message_request(effective_reply_to, body)
+-            return await self._run_blocking(self._client.im.v1.message.reply, request)
+         if thread_id:
+             # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
+             receive_id, receive_id_type = thread_id, "thread_id"
+@@ -4484,6 +4553,16 @@ def interactive_setup() -> None:
+     save_env_value("FEISHU_GROUP_POLICY", "open" if group_idx == 0 else "disabled")
+     print_info("Group chats enabled (bot must be @mentioned)." if group_idx == 0 else "Group chats disabled.")
+ 
++    # 豆花本机补丁（分话题）：setup 向导显式询问是否用话题回复。
++    # v0.23.0 升级恢复 adapter.py 时曾漏掉此 hunk，导致向导不再写 FEISHU_THREAD_REPLY。
++    if group_idx == 0:
++        thread_idx = prompt_choice(
++            "How should the bot answer in group chats?",
++            ["Quote-reply in the main chat (default)", "Reply inside a topic thread — each question spawns its own topic"],
++            0,
++        )
++        save_env_value("FEISHU_THREAD_REPLY", str(bool(thread_idx)).lower())
++
+     print_info("Leave blank to clear a previously saved home channel (cron / notifications).")
+     home_channel = prompt("Home chat ID (optional, for cron/notifications)", password=False).strip()
+     if home_channel:
+diff --git a/plugins/platforms/feishu/adapter_choice_cards.py b/plugins/platforms/feishu/adapter_choice_cards.py
+index 06679e35ed..d9008321b4 100644
+--- a/plugins/platforms/feishu/adapter_choice_cards.py
++++ b/plugins/platforms/feishu/adapter_choice_cards.py
+@@ -9,6 +9,7 @@ it answers anything.
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import itertools
+ import json
+ import logging
+@@ -16,12 +17,22 @@ from typing import Any, Optional
+ 
+ from agent.i18n import t
+ from gateway.platforms.base import SendResult
++from plugins.platforms.feishu.feishu_setup_cards import cached_catalog, reasoning_effort_value
+ 
+ logger = logging.getLogger(__name__)
+ 
+ _BUTTON_LABEL_MAX = 40
+ 
+ 
++def _probe_provider_credentials(provider: str, model: str) -> dict:
++    """Resolve a provider's runtime credentials the same way a turn would.
++
++    Kept module-level so tests can stub it without importing ``gateway.run``.
++    """
++    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
++    return _resolve_runtime_agent_kwargs_for_provider(provider, target_model=model)
++
++
+ class FeishuChoiceCardsMixin:
+     """Clarify and choice-picker cards for ``FeishuAdapter`` (needs its card/state helpers)."""
+ 
+@@ -31,9 +42,11 @@ class FeishuChoiceCardsMixin:
+         ("hermes_update_prompt_action", "_handle_update_prompt_card_action"),
+         ("hermes_clarify_action", "_handle_clarify_card_action"),
+         ("hermes_choice_picker_action", "_handle_choice_picker_card_action"),
++        ("hermes_feishu_form_action", "_handle_feishu_form_card_action"),
+     )
+ 
+     def _init_choice_card_state(self) -> None:
++        self._picker_form_state: dict[str, dict[str, Any]] = {}
+         # clarify_id -> {session_key, message_id, chat_id, question}
+         self._clarify_state: dict[str, dict[str, str]] = {}
+         # picker_id -> {session_key, message_id, chat_id, body, choices, on_choice_selected, metadata}
+@@ -234,3 +247,518 @@ class FeishuChoiceCardsMixin:
+             result_text = t("platform.feishu.picker.apply_error", error=str(exc))
+         if result_text:
+             await self.send(state["chat_id"], str(result_text), metadata=state.get("metadata"))
++
++    #
++    # 2026-11-09 重写要点（全部依据实测，不再手搓 session 状态）：
++    #   1. 模型/渠道一律来自 Hermes 自己的 picker 目录（list_picker_providers），不再有硬编码表；
++    #   2. 新建话题用 gateway._session_key_for_source() 生成会话键，与入站消息完全一致；
++    #   3. 路由写入走 store.set_model_override({"model","provider"}) + 清空内存键让
++    #      _rehydrate_session_model_override 按 provider 重新解析凭据（与重启后同一路径），
++    #      写完立刻回读校验，失败如实报错，不再"点了就算成功"；
++    #   4. /model 提交优先走 gateway 原生 picker 回调（校验/DB/笔记/全局语义都一致）；
++    #   5. 思考等级走 gateway._apply_reasoning_selection（与 /reasoning 同一实现）。
++
++    def _picker_gw(self):
++        handler = getattr(self, "_message_handler", None)
++        return getattr(handler, "__self__", None) or getattr(self, "gateway_runner", None)
++
++    def _session_route_now(self, session_key: str, fallback_provider: str) -> dict[str, Any]:
++        """Current model/provider/reasoning of a session (authoritative: the gateway)."""
++        gw = self._picker_gw()
++        override: dict = {}
++        reasoning = None
++        if gw is not None:
++            try:
++                override = gw._session_model_override(session_key) or {}
++            except Exception:
++                override = {}
++            if session_key:
++                try:
++                    reasoning = gw._resolve_session_reasoning_config(session_key=session_key)
++                except Exception:
++                    pass
++        return {
++            "model": override.get("model") or None,
++            "provider": override.get("provider") or fallback_provider,
++            "reasoning": reasoning_effort_value(reasoning),
++        }
++
++    def _remember_form_state(self, message_id: Optional[str], **state: Any) -> None:
++        if not message_id:
++            return
++        data = getattr(self, "_picker_form_state", None)
++        if data is None:
++            data = self._picker_form_state = {}
++        data[message_id] = state
++        while len(data) > 50:
++            data.pop(next(iter(data)), None)
++
++    def _form_state(self, message_id: Optional[str]) -> dict[str, Any]:
++        data = getattr(self, "_picker_form_state", {}) or {}
++        return dict(data.get(message_id) or {}) if message_id else {}
++
++    async def send_new_topic_picker(self, chat_id: str, *,
++                                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
++        """/new card: channels and models come from the live catalog, never a fixed table."""
++        from plugins.platforms.feishu.feishu_setup_cards import (
++            build_new_topic_card, catalog_is_truncated, load_catalog,
++        )
++
++        gw = self._picker_gw()
++        route = {"model": None, "provider": None, "reasoning": None}
++        if gw is not None:
++            try:
++                route["model"], runtime = await asyncio.to_thread(
++                    gw._resolve_session_agent_runtime, source=None, session_key=None)
++                route["provider"] = (runtime or {}).get("provider")
++            except Exception:
++                pass
++            try:
++                route["reasoning"] = await asyncio.to_thread(gw._resolve_session_reasoning_config)
++            except Exception:
++                pass
++        providers = await asyncio.to_thread(
++            load_catalog, route["provider"] or "", route["model"] or "")
++        if catalog_is_truncated(providers):
++            providers = await asyncio.to_thread(load_catalog, route["provider"] or "",
++                                                route["model"] or "", True)
++        card = build_new_topic_card(
++            current_model=route["model"], current_reasoning=route["reasoning"],
++            current_provider=route["provider"], chat_id=chat_id, providers=providers)
++        response = await self._feishu_send_with_retry(
++            chat_id=chat_id, msg_type="interactive",
++            payload=json.dumps(card, ensure_ascii=False),
++            reply_to=None, metadata=metadata or {"thread_reply": False})
++        result = self._finalize_send_result(response, "send_new_topic_picker failed")
++        self._remember_form_state(
++            getattr(result, "message_id", None),
++            chat_id=chat_id, model={"model": route["model"], "provider": route["provider"]},
++            reasoning_effort=route["reasoning"], view_provider=route["provider"])
++        return result
++
++    async def send_model_picker(
++        self,
++        chat_id: str,
++        providers: list,
++        current_model: str,
++        current_provider: str,
++        session_key: str,
++        on_model_selected,
++        metadata: Optional[dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send an interactive Form card for /model command."""
++        from plugins.platforms.feishu.feishu_setup_cards import (
++            build_model_switch_card, catalog_is_truncated, load_catalog, remember_catalog,
++        )
++        remember_catalog(providers)  # card callbacks reply from this cache
++        if catalog_is_truncated(providers):
++            providers = await asyncio.to_thread(load_catalog, current_provider, current_model, True)
++        route = self._session_route_now(session_key, current_provider)
++        current_model = route["model"] or current_model
++        current_provider = route["provider"] or current_provider
++
++        card = build_model_switch_card(
++            current_model=current_model,
++            current_reasoning=route["reasoning"],
++            current_provider=current_provider,
++            session_key=session_key,
++            providers=providers,
++        )
++        if not hasattr(self, "_model_picker_callbacks"):
++            self._model_picker_callbacks = {}
++        self._model_picker_callbacks[session_key] = on_model_selected
++        self._last_model_picker_skey = session_key  # 表单提交时 action.value 可能为空，兜底用
++
++        reply_to = self._resolve_reply_anchor(metadata) if hasattr(self, "_resolve_reply_anchor") else None
++        response = await self._feishu_send_with_retry(
++            chat_id=chat_id,
++            msg_type="interactive",
++            payload=json.dumps(card, ensure_ascii=False),
++            reply_to=reply_to,
++            metadata=metadata,
++        )
++        result = self._finalize_send_result(response, "send_model_picker failed")
++        self._remember_form_state(
++            getattr(result, "message_id", None), chat_id=chat_id, session_key=session_key,
++            model={"model": current_model, "provider": current_provider},
++            reasoning_effort=route["reasoning"], view_provider=current_provider)
++        return result
++
++    def _handle_feishu_form_card_action(self, *, event: Any, action_value: dict[str, Any], loop: Any,
++                                        form_value: Optional[dict[str, Any]] = None) -> Any:
++        """Handle Feishu Card 2.0 form submissions for /new topic and /model switch.
++
++        飞书**表单提交**时 SDK 的 ``action.value`` 常常为空，真正的数据在 ``action.form_value``，
++        按钮 payload 也不一定回传。三级推断：value → 按钮 name → form_value 字段。
++        卡片上一版的选择从 ``_picker_form_state[open_message_id]`` 回读（action.value 不可靠）。
++        """
++        from plugins.platforms.feishu.feishu_setup_cards import (
++            build_settled_card, build_new_topic_card, build_model_switch_card,
++            decode_option, get_channel_label, normalize_channels, pick_channel,
++        )
++
++        action = getattr(event, "action", None)
++        if not isinstance(form_value, dict) or not form_value:
++            form_value = getattr(action, "form_value", None) or {}
++            if not isinstance(form_value, dict):
++                form_value = {}
++        if not form_value:
++            op = getattr(event, "operator", None)
++            cand = getattr(op, "form_value", None) if op is not None else None
++            if isinstance(cand, dict):
++                form_value = cand
++
++        btn_name = str(getattr(action, "name", "") or "")
++        context = getattr(event, "context", None)
++        chat_id = (str((action_value or {}).get("chat_id") or "")
++                   or str(getattr(context, "open_chat_id", "") or ""))
++        card_message_id = str(getattr(context, "open_message_id", "") or "")
++        state = self._form_state(card_message_id)
++        logger.info("[Feishu] Form submit: value=%r name=%r keys=%r card_msg=%s",
++                    action_value if isinstance(action_value, dict) else type(action_value).__name__,
++                    btn_name, list(form_value), card_message_id)
++
++        action_type = str((action_value or {}).get("hermes_feishu_form_action") or "").strip()
++        if not action_type:
++            low = btn_name.lower()
++            if "chan" in low:
++                action_type = "select_channel"
++            elif "new" in low:
++                action_type = "new_topic"
++            elif "model" in low or "switch" in low:
++                action_type = "switch_model"
++            elif "topic_name" in form_value:
++                action_type = "new_topic"
++            elif "model_select" in form_value:
++                action_type = "switch_model"
++
++        # ── 渠道 Tab：只看不改，重绘成该渠道的模型列表 ──
++        if action_type == "select_channel":
++            view = str((action_value or {}).get("provider") or "").strip()
++            card_type = str((action_value or {}).get("card_type") or "").strip()
++            if not card_type:
++                card_type = "switch_model" if state.get("session_key") else "new_topic"
++            topic_name = str((action_value or {}).get("topic_name") or state.get("topic_name") or "")
++            reasoning = str((action_value or {}).get("reasoning") or state.get("reasoning_effort") or "")
++            providers = cached_catalog()
++
++            if card_type == "switch_model":
++                target_skey = str((action_value or {}).get("session_key") or state.get("session_key") or "")
++                route = self._session_route_now(target_skey, "")
++                new_card = build_model_switch_card(
++                    current_model=route["model"],
++                    current_reasoning=reasoning or route["reasoning"],
++                    current_provider=route["provider"],
++                    session_key=target_skey or None,
++                    providers=providers, view_provider=view or None,
++                )
++            else:
++                new_card = build_new_topic_card(
++                    current_model=(state.get("model") or {}).get("model"),
++                    current_reasoning=reasoning or state.get("reasoning_effort"),
++                    current_provider=(state.get("model") or {}).get("provider"),
++                    chat_id=chat_id,
++                    topic_name_init=topic_name or None,
++                    providers=providers, view_provider=view or None,
++                )
++            if card_message_id and view:
++                self._remember_form_state(card_message_id, **{**state, "view_provider": view})
++            return self._card_response(new_card)
++
++        # ── 新建话题 ──
++        if action_type == "new_topic":
++            import time
++            channels = normalize_channels(cached_catalog())
++            view = str(state.get("view_provider") or "")
++            ch = pick_channel(view, channels)
++            fallback_provider = str((action_value or {}).get("provider") or (ch or {}).get("slug") or "")
++            provider, model = decode_option(form_value.get("model_select"), fallback_provider)
++            if not model and ch is not None:
++                model = ch["models"][0]
++            reasoning = str(form_value.get("reasoning_select") or "").strip()
++            topic_name = (str(form_value.get("topic_name") or "").strip()
++                          or f"新话题 {time.strftime('%m-%d %H:%M')}")
++            if not model or not provider:
++                return self._card_response(build_settled_card(
++                    "⚠️ 未选择模型", "请先点选一个渠道，再在下拉框里选具体模型。", template="orange"))
++
++            self._submit_on_loop(loop, self._create_feishu_topic_from_form(
++                chat_id=chat_id, topic_name=topic_name, model=model,
++                reasoning=reasoning, provider=provider,
++                form_message_id=card_message_id, form_state=state,
++            ))
++            settled = build_settled_card(
++                f"话题【{topic_name}】正在创建",
++                f"**话题名称**：{topic_name}\n"
++                f"**渠道来源**：`{get_channel_label(provider, channels)}`\n"
++                f"**执行模型**：`{model}`\n"
++                f"**思考等级**：`{reasoning or '默认'}`\n\n"
++                f"正在建立话题并写入会话配置，几秒内会在本卡更新实际生效结果。",
++                template="blue")
++            return self._card_response(settled)
++
++        # ── 切换模型 ──
++        if action_type == "switch_model":
++            view = str(state.get("view_provider") or "")
++            channels = normalize_channels(cached_catalog())
++            fallback_provider = str((action_value or {}).get("provider") or view or "")
++            provider, model = decode_option(form_value.get("model_select"), fallback_provider)
++            reasoning = str(form_value.get("reasoning_select") or "").strip()
++            session_key = (str((action_value or {}).get("session_key") or "")
++                           or str(state.get("session_key") or "")
++                           or str(getattr(self, "_last_model_picker_skey", "") or ""))
++            if not session_key:
++                return self._card_response(build_settled_card(
++                    "⚠️ 无法定位会话", "请在本话题内重新发送 /model。", template="orange"))
++            if not model:
++                return self._card_response(build_settled_card(
++                    "⚠️ 未选择模型", "请在渠道点选后，于下拉框里选择具体模型。", template="orange"))
++
++            self._submit_on_loop(loop, self._apply_feishu_model_switch_from_form(
++                chat_id=chat_id, session_key=session_key, model=model,
++                reasoning=reasoning, provider=provider,
++                form_message_id=card_message_id, form_state=state,
++            ))
++            settled = build_settled_card(
++                "模型配置应用中",
++                f"**渠道来源**：`{get_channel_label(provider, channels)}`\n"
++                f"**目标模型**：`{model}`\n"
++                f"**思考等级**：`{reasoning or '保持当前'}`\n\n"
++                f"正在写入会话并校验凭据，几秒内会在本卡更新实际生效结果。",
++                template="blue")
++            return self._card_response(settled)
++
++        logger.warning("[Feishu] Form submit with unknown action: value=%r name=%r keys=%r",
++                       action_value, btn_name, list(form_value))
++        return self._card_response()
++
++    def _patch_card_message(self, message_id: str, card: dict[str, Any], *, delay: float = 1.5) -> None:
++        """Replace a card message's content with the real outcome (after the callback settles)."""
++        import time as _time
++        from plugins.platforms.feishu.cardkit import _api
++        if not message_id:
++            return
++        _time.sleep(delay)  # 回调期间飞书拒绝改卡（200810）；等它释放
++        obj, code = _api("PATCH", f"/im/v1/messages/{message_id}",
++                         {"msg_type": "interactive",
++                          "content": json.dumps(card, ensure_ascii=False)})
++        if obj.get("code") != 0:
++            logger.warning("[Feishu] card result patch failed: code=%s http=%s %s",
++                           obj.get("code"), code, obj.get("msg"))
++
++    async def _apply_route_to_session(self, gw: Any, session_key: str, *, model: str = "",
++                                      provider: str = "", reasoning: str = "") -> tuple[bool, list[str]]:
++        """Write model/provider/reasoning for a session and verify it actually landed.
++
++        Model routing is persisted exactly like /model (non-secret keys) and then rehydrated
++        through ``_rehydrate_session_model_override`` — the same path a gateway restart uses —
++        so api_key/base_url come from the provider's own resolution instead of a hand-built
++        dict that skipped them.
++        """
++        notes: list[str] = []
++        ok = True
++        if model and provider:
++            override = {"model": model, "provider": provider, "base_url": None}
++            async_store = getattr(gw, "async_session_store", None)
++            store = getattr(gw, "session_store", None)
++            try:
++                if async_store is not None:
++                    await async_store.set_model_override(session_key, override)
++                elif store is not None:
++                    await asyncio.to_thread(store.set_model_override, session_key, override)
++            except Exception as exc:
++                return False, [f"写入会话失败：{exc}"]
++            try:
++                gw._session_state(session_key).conversation.model_override = None  # 让 rehydrate 生效
++                gw._rehydrate_session_model_override(session_key)
++            except Exception as exc:
++                logger.debug("[Feishu] rehydrate after override failed: %s", exc)
++            live = {}
++            try:
++                live = gw._session_model_override(session_key) or {}
++            except Exception:
++                pass
++            if (live.get("model") or "") != model:
++                ok = False
++                notes.append("⚠️ 会话路由未回读到目标模型，请重试或在话题里发 /model 确认")
++            else:
++                try:
++                    await asyncio.to_thread(_probe_provider_credentials, provider, model)
++                except Exception as exc:
++                    ok = False
++                    notes.append(f"⚠️ 模型已写入，但渠道凭据解析失败：{exc}")
++            try:
++                gw._evict_cached_agent(session_key)
++            except Exception:
++                pass
++
++        if reasoning:
++            current = None
++            try:
++                current = reasoning_effort_value(gw._resolve_session_reasoning_config(session_key=session_key))
++            except Exception:
++                pass
++            if reasoning == "reset" or current != reasoning:
++                try:
++                    notes.append(gw._apply_reasoning_selection(session_key, "feishu", reasoning))
++                except Exception as exc:
++                    ok = False
++                    notes.append(f"⚠️ 思考等级设置失败：{exc}")
++            else:
++                notes.append(f"思考等级保持 `{reasoning}`（与当前一致，未新增会话级覆盖）")
++        return ok, notes
++
++    async def _create_feishu_topic_from_form(
++        self, chat_id: str, topic_name: str, model: str, reasoning: str,
++        provider: Optional[str] = None, form_message_id: str = "",
++        form_state: Optional[dict[str, Any]] = None,
++    ) -> None:
++        """Create a topic thread and bind model/provider/reasoning to ITS session key."""
++        from plugins.platforms.feishu.cardkit import _api
++        from plugins.platforms.feishu.feishu_setup_cards import (
++            build_settled_card, get_channel_label, normalize_channels, pick_channel,
++        )
++
++        root_msg_id = ""
++        notes: list[str] = []
++        ok = True
++        try:
++            channels = normalize_channels()
++            prov_label = get_channel_label(provider, channels)
++            root_card = {
++                "schema": "2.0",
++                "header": {"title": {"tag": "plain_text", "content": topic_name[:80]},
++                           "template": "turquoise"},
++                "body": {"elements": [{"tag": "markdown", "content": (
++                    f"**{topic_name}**\n\n"
++                    f"渠道 `{provider or '默认'}` · 模型 `{model or '默认'}` · 思考 `{reasoning or '默认'}`\n\n"
++                    "直接在本话题下回复即可开始，上下文独立。")}]},
++            }
++            sobj, _ = _api("POST", "/im/v1/messages",
++                           {"receive_id": chat_id, "msg_type": "interactive",
++                            "content": json.dumps(root_card, ensure_ascii=False)},
++                           params={"receive_id_type": "chat_id"})
++            root_msg_id = (sobj.get("data") or {}).get("message_id") or ""
++            if not root_msg_id:
++                raise RuntimeError(f"发送话题卡失败：code={sobj.get('code')} {sobj.get('msg')}")
++
++            robj, _ = _api("POST", f"/im/v1/messages/{root_msg_id}/reply",
++                           {"msg_type": "text", "reply_in_thread": True,
++                            "content": json.dumps({"text": "在话题内直接回复即可开始。"}, ensure_ascii=False)})
++            thread_id = (robj.get("data") or {}).get("thread_id") or ""
++            if not thread_id:
++                raise RuntimeError(f"话题 thread 未建立：code={robj.get('code')} {robj.get('msg')}")
++
++            gw = self._picker_gw()
++            if gw is None:
++                ok = False
++                notes.append("⚠️ 网关句柄缺失：话题已建，但模型/思考等级未写入")
++            else:
++                try:
++                    chat_info = await self.get_chat_info(chat_id)
++                except Exception:
++                    chat_info = {}
++                chat_type = str((chat_info or {}).get("type") or "dm")
++                if chat_type not in {"dm", "group", "forum"}:
++                    chat_type = "dm" if chat_type in {"p2p", ""} else "group"
++                source = self.build_source(
++                    chat_id=chat_id, chat_name=(chat_info or {}).get("name") or chat_id,
++                    chat_type=chat_type, thread_id=thread_id)
++                try:
++                    await asyncio.to_thread(gw.session_store.get_or_create_session, source)
++                except Exception as exc:
++                    logger.debug("[Feishu] get_or_create_session failed: %s", exc)
++                session_key = gw._session_key_for_source(source)
++                ok, notes = await self._apply_route_to_session(
++                    gw, session_key, model=model, provider=provider or "", reasoning=reasoning)
++                logger.info("[Feishu] new topic %s skey=%s ok=%s notes=%r",
++                            thread_id, session_key, ok, notes)
++        except Exception as exc:
++            ok = False
++            notes.append(f"❌ 建话题失败：{exc}")
++            logger.warning("[Feishu] Failed to create topic from form: %s", exc, exc_info=True)
++
++        status = "✅" if ok else "⚠️"
++        detail = "\n".join(f"- {n}" for n in notes) if notes else ""
++        settled = build_settled_card(
++            f"{status} 话题【{topic_name}】" + ("就绪" if ok else "创建异常"),
++            f"**渠道来源**：`{provider or '默认'}`\n"
++            f"**执行模型**：`{model or '默认'}`\n"
++            f"**思考等级**：`{reasoning or '默认'}`\n\n{detail}\n\n"
++            "进入该话题直接对话即可；如需改配置，在话题内发 /model。",
++            template="green" if ok else "orange")
++        if form_message_id:
++            self._patch_card_message(form_message_id, settled)
++
++    async def _apply_feishu_model_switch_from_form(
++        self, chat_id: str, session_key: str, model: str, reasoning: str,
++        provider: Optional[str] = None, form_message_id: str = "",
++        form_state: Optional[dict[str, Any]] = None,
++    ) -> None:
++        """Apply model/reasoning from the /model card and report the verified outcome."""
++        from plugins.platforms.feishu.feishu_setup_cards import build_settled_card, get_channel_label, normalize_channels
++
++        state = form_state or {}
++        prev = state.get("model") if isinstance(state.get("model"), dict) else {}
++        prev = prev or {}
++        # 与「本卡发出时」的会话状态比较，而不是与刚写入后的状态比较（否则永远判为未变）。
++        unchanged = bool(prev.get("model")) and (prev.get("model") == model
++                                                and prev.get("provider") == (provider or prev.get("provider")))
++        ok = True
++        notes: list[str] = []
++        gw = self._picker_gw()
++        channels = normalize_channels()
++        label = get_channel_label(provider, channels)
++
++        if gw is None:
++            ok = False
++            notes.append("⚠️ 网关句柄缺失：无法写入会话配置")
++        else:
++            cb = (getattr(self, "_model_picker_callbacks", {}) or {}).get(session_key)
++            if cb is not None and not unchanged:
++                # 原生 picker 回调：解析 provider、写 DB、置 next-turn note、驱逐 agent 都走官方路径。
++                try:
++                    text = await cb(chat_id, model, provider or "")
++                except Exception as exc:
++                    ok = False
++                    notes.append(f"❌ 切换失败：{exc}")
++                else:
++                    if text:
++                        body = str(text)
++                        if body.lower().startswith("error") or "失败" in body:
++                            ok = False
++                        notes.append(body.splitlines()[0])
++            else:
++                # 无回调（网关重启过 / 本话题非当前 picker）或选择未变：直接写路由并回读校验。
++                if unchanged:
++                    notes.append("模型与卡片发出时一致，按当前选择重申一次并校验")
++                write_ok, write_notes = await self._apply_route_to_session(
++                    gw, session_key, model=model, provider=provider or "", reasoning="")
++                ok = ok and write_ok
++                notes.extend(write_notes)
++            if reasoning:
++                try:
++                    notes.append(gw._apply_reasoning_selection(session_key, "feishu", reasoning))
++                except Exception as exc:
++                    ok = False
++                    notes.append(f"⚠️ 思考等级设置失败：{exc}")
++            try:
++                gw._evict_cached_agent(session_key)
++            except Exception:
++                pass
++
++        status = "✅" if ok else "⚠️"
++        settled = build_settled_card(
++            f"{status} 模型配置" + ("已生效" if ok else "未完全生效"),
++            f"**渠道来源**：`{label}`\n"
++            f"**当前模型**：`{model}`\n"
++            f"**思考等级**：`{reasoning or '保持当前'}`\n\n"
++            + ("\n".join(f"- {n}" for n in notes) if notes else ""),
++            template="green" if ok else "orange")
++        if form_message_id:
++            self._patch_card_message(form_message_id, settled)
++            route = self._session_route_now(session_key, provider or "")
++            self._remember_form_state(form_message_id, **{
++                **state, "model": {"model": model, "provider": provider},
++                "reasoning_effort": reasoning or route["reasoning"],
++                "view_provider": provider, "session_key": session_key})
+diff --git a/plugins/platforms/feishu/cardkit.py b/plugins/platforms/feishu/cardkit.py
+new file mode 100644
+index 0000000000..ed92c6fa93
+--- /dev/null
++++ b/plugins/platforms/feishu/cardkit.py
+@@ -0,0 +1,1133 @@
++"""Feishu CardKit 2.0 streaming transport (豆花本机扩展, 2026-11-06).
++
++Turns ONE Feishu assistant turn into ONE live 2.0 card:
++  header(session.title) + status_line + main_answer(typewriter) +
++  collapsible_panel("思考过程", think_text) + collapsible_panel("工具调用", tool_text).
++
++Verified against the LIVE Feishu API on 2026-11-06 (cardkit_probe.py / cardkit_demo.py):
++  * POST /cardkit/v1/cards             -> card_id  (type=card_json, data=<json string>)
++  * POST /im/v1/messages               -> send card (content={"type":"card","data":{"card_id":...}})
++  * POST /im/v1/messages/{id}/reply    -> reply-in-thread variant
++  * PUT  /cardkit/v1/cards/{id}/elements/{eid}/content {"content","sequence"} -> typewriter
++  * PATCH /cardkit/v1/cards/{id}/settings {"settings":"<json>","uuid","sequence"} -> toggle streaming
++  * `sequence` is CARD-GLOBAL and must strictly increase across ALL elements/settings.
++  * Card entity can be sent only ONCE. streaming_mode auto-closes 10 min after last open.
++  * JSON 2.0 cards need client >= 7.20; older clients show an "upgrade" placeholder.
++
++Pure stdlib. All network errors are swallowed and surfaced via last_error / success
++flags so a broken card can NEVER take down a gateway run. Gate: FEISHU_CARDKIT=1
++in ~/.hermes/.env (default OFF -> zero behaviour change).
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import sqlite3
++import threading
++import time
++import urllib.error
++import urllib.request
++import uuid
++from pathlib import Path
++from typing import Optional
++
++BASE = "https://open.feishu.cn/open-apis"
++_ENV = Path.home() / ".hermes" / ".env"
++_DB = Path.home() / ".hermes" / "state.db"
++_TOKEN_CACHE = {"token": None, "exp": 0.0}
++_TOKEN_LOCK = threading.Lock()
++
++# Karing full-tunnel hijacks port 53 / DNS for domestic endpoints; drop proxy for these calls.
++for _k in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
++           "https_proxy", "http_proxy", "all_proxy"):
++    os.environ.pop(_k, None)
++
++# One live card per *session scope* (2026-11-07 修)。原实现是 chat_id 单槽：多话题并发时
++# 后一轮 ensure() 会 finalize 掉前一轮的卡，思考/工具/正文串台或溢出卡外。
++# 现在按 session_key > (chat_id,thread_id) > chat_id 分槽，别名表兼容只传 chat_id 的旧钩子。
++_ACTIVE: dict[str, "CardKitStream"] = {}   # scope -> card
++_ALIASES: dict[str, str] = {}              # lookup alias -> scope
++_RECENT_CARDS: dict[str, "CardKitStream"] = {}  # 最近卡片归档缓存（保证封卡后终态仍能 PATCH 覆盖）
++_ACTIVE_LOCK = threading.Lock()
++
++
++def _scope(chat_id: str, thread_id: Optional[str] = None,
++           session_key: Optional[str] = None) -> str:
++    """Prefer the exact session key; fall back to thread, then bare chat."""
++    if session_key:
++        return str(session_key)
++    if thread_id:
++        return f"{chat_id}|{thread_id}"
++    return str(chat_id)
++
++
++# Feishu closes a card entity's streaming mode 600 s after it was (last) opened.
++# Measured 2026-11-09 with probe cards:
++#   * PATCH settings streaming_mode=true while still open (t=480 s) is a no-op: the card
++#     still died at the same instant (PUT 200850 "card streaming timeout", then 300309).
++#   * The same PATCH *after* closure works: t=620 s 200850 -> re-arm success -> PUTs at
++#     t=640 s and t=900 s succeed again.
++# So: keep streaming until a PUT reports closure, re-arm once, retry that PUT. Only if
++# re-arming fails do we fall back to whole-card PATCH /im/v1/messages/{id}.
++STREAMING_WINDOW_SECS = 600
++STREAM_CLOSED_CODES = (200850, 300309)
++MAX_STREAM_REARMS = 30          # 30 x 10 min = 5 h of live streaming per card
++
++
++class ElementPolicy:
++    """五个元素的显示策略（2026-11-07 系统性重构）。
++
++    CardKit 的 collapsible_panel 展开即全量，所以「只显示部分」必须在写入层做。
++    """
++    TITLE_MAX = 24          # header 取本轮消息摘要前 N 字
++    THINK_LINES = 5         # 思考过程只显示最近 N 行（2026-11-07 用户定案）
++    THINK_LINE_WIDTH = 88   # 无换行推理流按此宽度软切行
++    THINK_BUFFER_MAX = 20000  # 累积缓冲上限（仅用于切行计算）
++    TOOL_DETAIL_MAX = 12    # 工具明细只保留最近 N 条
++    FLUSH_MIN_GAP = 0.2     # 状态行 / 正文：近实时
++    PANEL_FLUSH_GAP = 2.0   # 折叠面板（思考/工具）：整段重绘，必须显著降频
++    FULL_PATCH_GAP = 6.0    # 流式窗口关闭后：整卡 PATCH（每次重绘全卡，必须更慢）
++
++
++def _think_visible(text: str, *, final: bool = False) -> str:
++    """平滑固定视窗思考流展示：
++    1. 流式思考中（final=False）：
++       - 当字数超过视窗阈值（~360字）时，早期内容自动向上收起，视窗固定在最新推理段落；
++       - 顶部采用恒定高度单行提示，绝无动态数字跳跃，彻底消除页面抖动与跳行；
++    2. 收尾归档（final=True）：
++       - 恢复 100% 全量未截断的完整思考记录，归入折叠面板供随时展开查阅。
++    """
++    clean = text.strip() if text else ""
++    if not clean:
++        return "（本轮模型无独立推理流）" if final else "（等待思考中…）"
++    if final:
++        return clean
++    if len(clean) <= 360:
++        return clean
++
++    tail = clean[-350:]
++    first_nl = tail.find("\n")
++    if 0 < first_nl < 40:
++        tail = tail[first_nl + 1:]
++    return "<font color='grey'>▲ 早期思考已向上收起 · 正在最新推理…</font>\n\n" + tail
++
++
++def format_tool_display(tool_name: str, args: Optional[dict] = None, preview: Optional[str] = None) -> str:
++    """Format tool call item in professional developer style (matching screenshot):
++    <font color='blue'>●</font>  ✅ **`tool_name`** — `command / query / path`
++    """
++    cmd = ""
++    if isinstance(args, dict):
++        if "command" in args:
++            cmd = str(args["command"])
++        elif "cmd" in args:
++            cmd = str(args["cmd"])
++        elif "query" in args:
++            cmd = str(args["query"])
++        elif "path" in args:
++            cmd = str(args["path"])
++        elif "url" in args:
++            cmd = str(args["url"])
++        elif "pattern" in args:
++            cmd = str(args["pattern"])
++        elif "prompt" in args:
++            cmd = str(args["prompt"])
++        elif "text" in args:
++            cmd = str(args["text"])
++        elif args:
++            parts = [f"{k}={v!r}" for k, v in list(args.items())[:2]]
++            cmd = ", ".join(parts)
++    if not cmd and preview:
++        cmd = str(preview).strip()
++
++    if cmd:
++        cmd = " ".join(cmd.split())
++        if len(cmd) > 120:
++            cmd = cmd[:118] + "…"
++        cmd_str = f" — `{cmd}`"
++    else:
++        cmd_str = ""
++
++    display_tool = "bash" if tool_name in ("terminal", "bash") else tool_name
++    return f"<font color='blue'>●</font>  ✅ **`{display_tool}`**{cmd_str}"
++
++
++class ToolCallEntry(str):
++    """Tool entry that behaves like a string (tool_name) for backward compatibility
++    while preserving formatted developer display string."""
++    __slots__ = ("tool_name", "args", "preview", "formatted")
++
++    def __new__(cls, tool_name: str, args: Optional[dict] = None, preview: Optional[str] = None):
++        inst = super().__new__(cls, tool_name)
++        inst.tool_name = tool_name
++        inst.args = args
++        inst.preview = preview
++        inst.formatted = format_tool_display(tool_name, args=args, preview=preview)
++        return inst
++
++
++def _render_footer_text(model: Optional[str] = None, reasoning_effort: Optional[str] = None) -> str:
++    parts = []
++    if model:
++        parts.append(f"模型: `{model}`")
++    if reasoning_effort:
++        parts.append(f"思考等级: `{reasoning_effort}`")
++    if not parts:
++        return "<font color='grey'>模型: 默认  ·  思考等级: 默认</font>"
++    return "<font color='grey'>" + "  ·  ".join(parts) + "</font>"
++
++
++def _title_from_hint(hint: Optional[str], fallback: str = "会话") -> str:
++    """本轮用户消息 → 卡片标题；彻底不查 state.db（自动标题有落库竞态）。"""
++    s = str(hint or "").strip()
++    if s.startswith("[Replying to:"):
++        i = s.find("]")
++        if i >= 0:
++            s = s[i + 1:].strip()
++    s = " ".join(s.split())[:ElementPolicy.TITLE_MAX]
++    return s or fallback
++
++
++def _env_creds() -> dict:
++    creds = {}
++    try:
++        for line in _ENV.read_text(encoding="utf-8", errors="ignore").splitlines():
++            line = line.strip()
++            if not line or line.startswith("#"):
++                continue
++            mm = re.match(r"(?:export\s+)?([A-Za-z0-9_]+)\s*=\s*(.*)$", line)
++            if mm:
++                creds[mm.group(1)] = mm.group(2).strip().strip('"').strip("'")
++    except Exception:
++        pass
++    return creds
++
++
++def enabled() -> bool:
++    """Opt-in gate. Default OFF -> adapter send/edit keep their original behaviour."""
++    return str(_env_creds().get("FEISHU_CARDKIT", "")).strip().lower() in ("1", "true", "yes", "on")
++
++
++def resolve(chat_id: str, *, thread_id: Optional[str] = None,
++            session_key: Optional[str] = None,
++            message_id: Optional[str] = None) -> Optional["CardKitStream"]:
++    """Find this turn's live card: exact keys first, then bare chat fallback."""
++    keys: list[str] = []
++    if message_id:
++        keys.append(f"msg:{message_id}")
++    if session_key:
++        keys.append(str(session_key))
++    if thread_id:
++        keys.append(f"{chat_id}|{thread_id}")
++    keys.append(str(chat_id))
++    with _ACTIVE_LOCK:
++        for k in keys:
++            scope = _ALIASES.get(k, k)
++            ck = _ACTIVE.get(scope)
++            if ck is not None and not ck.finalized:
++                return ck
++    return None
++
++
++def _log(event: str, **kw) -> None:
++    """卡片事件流水，写入 ~/.hermes/logs/cardkit_events.log（永不抛异常）。
++
++    on_send / on_edit / on_tool / finalize 都记一笔，下次「卡片空壳/没弹出」
++    能直接看是谁没被调用，不用再猜。
++    """
++    try:
++        rec = {"t": round(time.time(), 3), "event": event, **kw}
++        with open(Path.home() / ".hermes" / "logs" / "cardkit_events.log",
++                  "a", encoding="utf-8") as f:
++            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
++    except Exception:
++        pass
++
++
++def _streaming_on() -> bool:
++    """display.streaming 是否开启（纯文本探测，不引入 yaml 依赖；默认 True）。
++
++    streaming ON 时 gateway 的 adapter.send() 不代表最终答复；OFF 时才是。
++    """
++    try:
++        text = (Path.home() / ".hermes" / "config.yaml").read_text(
++            encoding="utf-8", errors="ignore")
++        m = re.search(r"^\s*streaming:\s*(true|false)\b", text, re.M | re.I)
++        return m is None or m.group(1).lower() != "false"
++    except Exception:
++        return True
++
++
++def get_active(chat_id: str, *, thread_id: Optional[str] = None,
++               session_key: Optional[str] = None,
++               message_id: Optional[str] = None) -> Optional["CardKitStream"]:
++    return resolve(chat_id, thread_id=thread_id, session_key=session_key,
++                   message_id=message_id)
++
++
++def activate(ck: "CardKitStream") -> None:
++    with _ACTIVE_LOCK:
++        _ACTIVE[ck.scope] = ck
++        aliases = [str(ck.chat_id)]
++        if ck.thread_id:
++            aliases.append(f"{ck.chat_id}|{ck.thread_id}")
++        if ck.session_key:
++            aliases.append(str(ck.session_key))
++        if ck.message_id:
++            aliases.append(f"msg:{ck.message_id}")
++        ck._aliases = list(dict.fromkeys(aliases + [ck.scope]))
++        for a in ck._aliases:
++            _ALIASES[a] = ck.scope
++
++
++def deactivate(ck: "CardKitStream") -> None:
++    with _ACTIVE_LOCK:
++        _ACTIVE.pop(ck.scope, None)
++        _RECENT_CARDS[ck.scope] = ck
++        if len(_RECENT_CARDS) > 30:
++            _RECENT_CARDS.pop(next(iter(_RECENT_CARDS)), None)
++        for a in getattr(ck, "_aliases", []):
++            if _ALIASES.get(a) == ck.scope:
++                _ALIASES.pop(a, None)
++
++
++def _tenant_token() -> Optional[str]:
++    with _TOKEN_LOCK:
++        if _TOKEN_CACHE["token"] and time.time() < _TOKEN_CACHE["exp"] - 60:
++            return _TOKEN_CACHE["token"]
++        c = _env_creds()
++        app_id, secret = c.get("FEISHU_APP_ID"), c.get("FEISHU_APP_SECRET")
++        if not app_id or not secret:
++            return None
++        body = json.dumps({"app_id": app_id, "app_secret": secret}).encode()
++        req = urllib.request.Request(
++            BASE + "/auth/v3/tenant_access_token/internal", data=body,
++            headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
++        try:
++            with urllib.request.urlopen(req, timeout=20) as r:
++                obj = json.loads(r.read().decode())
++            tok = obj.get("tenant_access_token")
++            if tok:
++                _TOKEN_CACHE["token"] = tok
++                _TOKEN_CACHE["exp"] = time.time() + int(obj.get("expire", 7200))
++                return tok
++        except Exception:
++            return None
++    return None
++
++
++def _api(method: str, path: str, body: Optional[dict] = None,
++         params: Optional[dict] = None) -> tuple[dict, int]:
++    tok = _tenant_token()
++    url = BASE + path
++    if params:
++        url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
++    data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
++    h = {"Content-Type": "application/json; charset=utf-8"}
++    if tok:
++        h["Authorization"] = "Bearer " + tok
++    req = urllib.request.Request(url, data=data, headers=h, method=method)
++    try:
++        with urllib.request.urlopen(req, timeout=20) as r:
++            return json.loads(r.read().decode()), 200
++    except urllib.error.HTTPError as e:
++        try:
++            return json.loads(e.read().decode()), e.code
++        except Exception:
++            return {"http_error": True}, e.code
++    except Exception as e:
++        return {"exc": repr(e)}, -1
++
++
++def session_title(chat_id: str, thread_id: Optional[str] = None,
++                  session_key: Optional[str] = None) -> str:
++    """Real session.title, aligned to THIS turn (2026-11-07 修).
++
++    原来只按 chat_id 取「最近一条」session，多话题并发时 header 会贴到别的会话标题上。
++    优先用精确 session_key，其次 thread_id，最后才退回 chat_id。
++    """
++    try:
++        con = sqlite3.connect(f"file:{_DB}?mode=ro", uri=True, timeout=2.0)
++        con.row_factory = sqlite3.Row
++        title = None
++        if session_key:
++            row = con.execute(
++                "select title from sessions where session_key=? "
++                "order by last_activity_at desc limit 1", (session_key,)).fetchone()
++            title = row["title"] if row else None
++        if not title and thread_id:
++            row = con.execute(
++                "select title from sessions where thread_id=? "
++                "order by last_activity_at desc limit 1", (thread_id,)).fetchone()
++            title = row["title"] if row else None
++        if not title and chat_id:
++            row = con.execute(
++                "select title from sessions where chat_id=? "
++                "order by last_activity_at desc limit 1", (chat_id,)).fetchone()
++            title = row["title"] if row else None
++        con.close()
++        return title or "会话"
++    except Exception:
++        return "会话"
++
++
++def _mk_card(title: str, model: Optional[str] = None, reasoning_effort: Optional[str] = None) -> dict:
++    def panel(eid, label, inner):
++        return {
++            "tag": "collapsible_panel", "element_id": eid, "expanded": False,
++            "header": {"title": {"tag": "plain_text", "content": label},
++                       "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined",
++                                "size": "16px 16px"},
++                       "icon_position": "right", "icon_expanded_angle": -180},
++            "border": {"color": "grey", "corner_radius": "6px"},
++            "padding": "8px 12px 8px 12px",
++            "elements": [{"tag": "markdown", "element_id": inner, "content": "（等待中…）"}],
++        }
++    return {
++        "schema": "2.0",
++        "config": {
++            "streaming_mode": True, "wide_screen_mode": True,
++            "summary": {"content": "回复生成中…"},
++            "streaming_config": {
++                "print_frequency_ms": {"default": 40, "android": 40, "ios": 40, "pc": 40},
++                "print_step": {"default": 2, "android": 2, "ios": 2, "pc": 2},
++                "print_strategy": "fast",
++            },
++        },
++        "header": {"title": {"tag": "plain_text", "content": title[:80]},
++                   "template": "turquoise"},
++        "body": {"elements": [
++            {"tag": "markdown", "element_id": "status_line", "content": "⏳ 生成中…"},
++            {"tag": "hr"},
++            {"tag": "markdown", "element_id": "main_answer", "content": "（等待回答…）"},
++            panel("think_panel", "思考过程", "think_text"),
++            panel("tool_panel", "工具调用", "tool_text"),
++            {"tag": "hr"},
++            {"tag": "markdown", "element_id": "model_footer", "content": _render_footer_text(model, reasoning_effort)},
++        ]},
++    }
++
++
++class CardKitStream:
++    """One assistant turn -> one live card. Thread-safe, non-raising, auto-finalizing."""
++
++    # 异常兜底 ONLY：建卡后若三个显式收尾信号(on_send / on_edit(finalize) / 下轮
++    # ensure)全都没发生，超时后自动封卡。放宽到 3600s（1小时），彻底避免长时间终端任务或大模型深度思考中途被误杀。
++    IDLE_FINALIZE_SECS = 3600
++
++    def __init__(self, chat_id: str, title: Optional[str] = None,
++                 reply_to: Optional[str] = None, thread_id: Optional[str] = None,
++                 session_key: Optional[str] = None,
++                 title_hint: Optional[str] = None):
++        self.chat_id = chat_id
++        self.thread_id = thread_id
++        self.session_key = session_key
++        self.scope = _scope(chat_id, thread_id, session_key)
++        # 标题来自本轮消息摘要，不再依赖异步落库的 session.title
++        self.title = title or _title_from_hint(title_hint)
++        self.reply_to = reply_to
++        self._aliases: list[str] = []
++        self._streamed = False
++        self.card_id: Optional[str] = None
++        self.message_id: Optional[str] = None
++        self.open_ok = False
++        self.finalized = False
++        self.last_error: Optional[str] = None
++        self.tool_count = 0
++        self.started = time.time()
++        self.model: Optional[str] = None
++        self.reasoning_effort: Optional[str] = None
++        self._seq = 0
++        # ── 本轮状态（所有写入只经 render()）──
++        self._answer = ""
++        self._think = ""                 # 已截断的可见思考文本
++        self._think_total = 0            # 累计字符数（用于「已省略前 N 字」）
++        self._tool_lines: list[str] = []  # 全部工具事件，按序号，不去重同名
++        self._status = "⏳ 生成中…"
++        self._last_interim = ""          # 最后一次中间播报，finalize 空正文时兜底
++        self._last_written: dict[str, str] = {}
++        self._last_put: dict[str, float] = {}
++        # Feishu auto-closes streaming_mode 600 s after it was opened. A PUT then returns
++        # 200850/300309; we re-arm (works once closed) and retry. Only a failed re-arm switches
++        # the card to whole-card PATCH on the message (see STREAMING_WINDOW_SECS).
++        self._stream_closed = False   # True only after a re-arm failed: whole-card PATCH mode
++        self._rearms = 0
++        self._rearm_ok = True
++        self._full_patch_at = 0.0
++        self._dirty = False
++        self._lock = threading.RLock()
++        self._timer: Optional[threading.Timer] = None
++        self._seal_timer: Optional[threading.Timer] = None
++        self._heartbeat_timer: Optional[threading.Timer] = None
++
++    def _next(self) -> int:
++        self._seq += 1
++        return self._seq
++
++    def open(self) -> bool:
++        """Create the card entity and send it exactly once."""
++        with self._lock:
++            if self.card_id:
++                return self.open_ok
++            card = _mk_card(self.title, self.model, self.reasoning_effort)
++            obj, code = _api("POST", "/cardkit/v1/cards",
++                             {"type": "card_json", "data": json.dumps(card, ensure_ascii=False)})
++            self.card_id = (obj.get("data") or {}).get("card_id")
++            if not self.card_id:
++                self.last_error = f"card.create code={obj.get('code')} http={code} {obj.get('msg')}"
++                return False
++            content = json.dumps({"type": "card", "data": {"card_id": self.card_id}},
++                                 ensure_ascii=False)
++            sent = False
++            if self.reply_to:
++                robj, rcode = _api("POST", f"/im/v1/messages/{self.reply_to}/reply",
++                                   {"msg_type": "interactive", "content": content,
++                                    "reply_in_thread": True})
++                if robj.get("code") == 0 and (robj.get("data") or {}).get("message_id"):
++                    self.message_id = robj["data"]["message_id"]
++                    sent = True
++                else:
++                    self.last_error = f"reply code={robj.get('code')} http={rcode}; fallback to create"
++            if not sent:
++                sobj, scode = _api("POST", "/im/v1/messages",
++                                   {"receive_id": self.chat_id, "msg_type": "interactive",
++                                    "content": content},
++                                   params={"receive_id_type": "chat_id"})
++                if sobj.get("code") == 0 and (sobj.get("data") or {}).get("message_id"):
++                    self.message_id = sobj["data"]["message_id"]
++                    sent = True
++                else:
++                    self.last_error = (f"send code={sobj.get('code')} http={scode} "
++                                       f"{sobj.get('msg')}")
++            self.open_ok = sent
++            if sent:
++                activate(self)
++                self._arm_finalize()
++                self._start_heartbeat()
++            return sent
++
++    # -- auto finalize & heartbeat ---------------------------------------------
++    def _start_heartbeat(self) -> None:
++        """长任务自动心跳：每 30 秒刷新一次运行耗时并 touch 续期，确保卡片长久存活。"""
++        if getattr(self, "_heartbeat_timer", None):
++            return
++        def _beat():
++            if self.finalized or not self.open_ok:
++                return
++            with self._lock:
++                if not self._answer:
++                    secs = int(time.time() - self.started)
++                    m, s = divmod(secs, 60)
++                    time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
++                    if self._think:
++                        self._status = f"🧠 思考中… (已推理 {self._think_total:,} 字) · ⏱️ {time_str}"
++                    elif self.tool_count > 0:
++                        self._status = f"🔧 执行工具中… (已调用 {self.tool_count} 次) · ⏱️ {time_str}"
++                    else:
++                        self._status = f"⏳ 正在处理中… · ⏱️ {time_str}"
++                    if self._stream_closed:
++                        # 无元素 PUT 可用：心跳直接把最新状态推上整卡。
++                        self._flush_full_card(force=True)
++                    else:
++                        self.render()
++            self._touch()
++            if not self.finalized:
++                t = threading.Timer(30.0, _beat)
++                t.daemon = True
++                self._heartbeat_timer = t
++                t.start()
++
++        t = threading.Timer(30.0, _beat)
++        t.daemon = True
++        self._heartbeat_timer = t
++        t.start()
++    def _arm_finalize(self) -> None:
++        if self.finalized:
++            return
++        if self._timer:
++            self._timer.cancel()
++        t = threading.Timer(self.IDLE_FINALIZE_SECS, self._auto_finalize)
++        t.daemon = True
++        self._timer = t
++        t.start()
++
++    def _auto_finalize(self) -> None:
++        try:
++            self.finalize()
++        except Exception:
++            pass
++
++    def _touch(self) -> None:
++        self._arm_finalize()
++        with self._lock:
++            if self._seal_timer is not None:
++                try:
++                    self._seal_timer.cancel()
++                except Exception:
++                    pass
++                self._seal_timer = None
++
++    # -- low-level -------------------------------------------------------------
++    def _content(self, eid: str, text: str, *, force: bool = False) -> bool:
++        # force=True 供 finalize() 收尾写入：此时 finalized 已置位，普通推流应停止，
++        # 但状态条 / 空态 / 关流式这几笔必须仍写得进去（2026-11-06 实测曾全被挡）。
++        if not self.open_ok or not self.card_id or (self.finalized and not force):
++            return False
++        # Re-arming already failed once: element PUTs are dead, whole-card PATCH carries on.
++        if self._stream_closed:
++            self._flush_full_card(force=force)
++            return True
++        obj = self._put_content(eid, text)
++        if obj.get("code") in STREAM_CLOSED_CODES:
++            # 飞书 600 秒流式窗口到点（2026-11-09 实测）。关闭后重新打开有效 → 重开并重发这一笔；
++            # 重开失败才降级为整卡 PATCH，保证长任务正文不丢。
++            _log("stream_closed", scope=self.scope, eid=eid, code=obj.get("code"),
++                 age=int(time.time() - self.started), rearms=self._rearms)
++            if self._rearm_streaming():
++                obj = self._put_content(eid, text)
++            if obj.get("code") in STREAM_CLOSED_CODES or not self._rearm_ok:
++                self._stream_closed = True
++                self._dirty = True
++                _log("stream_fallback_full_card", scope=self.scope, eid=eid,
++                     code=obj.get("code"), rearms=self._rearms)
++                self._flush_full_card(force=force)
++                return True
++        ok = obj.get("code") == 0
++        if not ok:
++            self.last_error = f"content({eid}) code={obj.get('code')} {obj.get('msg')}"
++        return ok
++
++    def _put_content(self, eid: str, text: str) -> dict:
++        obj, _code = _api("PUT", f"/cardkit/v1/cards/{self.card_id}/elements/{eid}/content",
++                          {"content": text, "sequence": self._next()})
++        return obj if isinstance(obj, dict) else {}
++
++    def _rearm_streaming(self) -> bool:
++        """Re-open streaming_mode after Feishu's 600 s auto-close (works only once closed)."""
++        if self._rearms >= MAX_STREAM_REARMS:
++            self._rearm_ok = False
++            return False
++        self._rearms += 1
++        obj, _code = _api("PATCH", f"/cardkit/v1/cards/{self.card_id}/settings",
++                          {"settings": json.dumps({"config": {"streaming_mode": True}}),
++                           "uuid": str(uuid.uuid4()), "sequence": self._next()})
++        self._rearm_ok = isinstance(obj, dict) and obj.get("code") == 0
++        _log("stream_rearm", scope=self.scope, ok=self._rearm_ok, n=self._rearms,
++             code=obj.get("code") if isinstance(obj, dict) else None)
++        return self._rearm_ok
++
++    def _full_card_payload(self) -> dict:
++        """Whole-card JSON for PATCH /im/v1/messages (no card_id entity needed)."""
++        def panel(label: str, inner: str, final: bool) -> dict:
++            content = self._render_element(inner, final=final) or "（无）"
++            return {
++                "tag": "collapsible_panel", "expanded": False,
++                "header": {"title": {"tag": "plain_text", "content": label[:40]},
++                           "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined",
++                                    "size": "16px 16px"},
++                           "icon_position": "right", "icon_expanded_angle": -180},
++                "border": {"color": "grey", "corner_radius": "6px"},
++                "padding": "8px 12px 8px 12px",
++                "elements": [{"tag": "markdown", "content": content}],
++            }
++
++        think_title = (f"思考过程（共 {len(self._think):,} 字）" if self._think else "思考过程")
++        tool_title = f"工具调用（共 {self.tool_count} 次）" if self.tool_count else "工具调用"
++        elements = [
++            {"tag": "markdown", "content": self._status or "⏳ 生成中…"},
++            {"tag": "hr"},
++            {"tag": "markdown", "content": self._render_element("main_answer") or "（等待回答…）"},
++            panel(think_title, "think_text", False),
++            panel(tool_title, "tool_text", False),
++        ]
++        footer = self._render_element("model_footer")
++        if footer:  # 空 markdown 会被飞书拒收
++            elements += [{"tag": "hr"}, {"tag": "markdown", "content": footer}]
++        return {
++            "schema": "2.0",
++            "config": {"wide_screen_mode": True, "summary": {"content": self.title[:60]}},
++            "header": {"title": {"tag": "plain_text", "content": self.title[:80]},
++                       "template": "turquoise"},
++            "body": {"elements": elements},
++        }
++
++    def _flush_full_card(self, *, force: bool = False) -> None:
++        """Rate-limited whole-card PATCH; the only write path once streaming closes."""
++        if not self.message_id:
++            return
++        now = time.time()
++        if not force and now - self._full_patch_at < ElementPolicy.FULL_PATCH_GAP:
++            return  # the next hook (or finalize) carries the newer state
++        self._full_patch_at = now
++        self._dirty = False
++        obj, code = _api("PATCH", f"/im/v1/messages/{self.message_id}",
++                         {"msg_type": "interactive",
++                          "content": json.dumps(self._full_card_payload(), ensure_ascii=False)})
++        ok = obj.get("code") == 0
++        if not ok:
++            self.last_error = f"full_patch code={obj.get('code')} http={code} {obj.get('msg')}"
++        _log("full_patch", scope=self.scope, ok=ok, http=code)
++
++    # -- 统一渲染层（2026-11-07 系统性重构）---------------------------------
++    def _render_element(self, eid: str, *, final: bool = False) -> str:
++        """由状态算出单个元素的目标文本。策略全部集中在 ElementPolicy。"""
++        if eid == "status_line":
++            return self._status
++        if eid == "main_answer":
++            return self._answer or ("（本轮无最终答复）" if final else "（等待回答…）")
++        if eid == "think_text":
++            if not self._think:
++                return "（本轮模型无独立推理流）" if final else "（等待中…）"
++            return _think_visible(self._think, final=final)
++        if eid == "tool_text":
++            n = len(self._tool_lines)
++            if not n:
++                return "（本轮无工具调用）" if final else "（等待中…）"
++            omit = max(0, n - ElementPolicy.TOOL_DETAIL_MAX)
++            lines = [f"🔧 {n} 次工具调用", ""]
++            if omit:
++                lines.append(f"<font color='grey'>（已省略前 {omit} 次调用）</font>\n")
++            for ev in self._tool_lines[-ElementPolicy.TOOL_DETAIL_MAX:]:
++                formatted = getattr(ev, "formatted", None)
++                if not formatted:
++                    formatted = ev if (isinstance(ev, str) and (ev.startswith("<font") or ev.startswith("●") or ev.startswith("✅"))) else format_tool_display(str(ev))
++                lines.append(formatted)
++            return "\n\n".join(lines)
++        if eid == "model_footer":
++            return _render_footer_text(self.model, self.reasoning_effort)
++        return ""
++
++    def render(self, *, force: bool = False) -> None:
++        """diff 后只 PUT 变化的元素；所有 hook 只改状态、调 render()。
++
++        禁止各 hook 直接拼文本写元素 —— 这是前四轮「修 A 坏 B」的根源。
++        force=True 用于 finalize：跳过节流并写最终空态。
++        """
++        if not self.open_ok or not self.card_id or self.finalized:
++            return
++        if self._stream_closed:
++            # 流式已关：本次 render 的所有变化都折进一次整卡 PATCH（节流由它自己管）。
++            self._flush_full_card(force=force)
++            return
++        now = time.time()
++        for eid in ("status_line", "main_answer", "think_text", "tool_text", "model_footer"):
++            text = self._render_element(eid, final=force)
++            if text == self._last_written.get(eid):
++                continue
++            # 折叠面板每次都是「前缀 + 600 字窗口」整段重发，飞书会重绘整块；
++            # 0.2s 节流实测约 5 次/秒 → 视觉抖动。面板单独用 2s，finalize 仍 force 刷准。
++            gap = (ElementPolicy.PANEL_FLUSH_GAP
++                   if eid in ("think_text", "tool_text")
++                   else ElementPolicy.FLUSH_MIN_GAP)
++            if not force and now - self._last_put.get(eid, 0.0) < gap:
++                continue  # 节流：留给下一次 render / finalize 的 force 刷
++            if self._content(eid, text):
++                self._last_written[eid] = text
++                self._last_put[eid] = now
++
++    def set_status(self, text: str) -> None:
++        with self._lock:  # sequence counter and state must be mutated atomically
++            self._status = text
++            self.render()
++
++    # -- streaming sinks -------------------------------------------------------
++    def push_answer(self, text: str) -> bool:
++        """累积全量正文；具体落卡由 render() 统一决定。"""
++        with self._lock:
++            if text is None or not self.open_ok or self.finalized:
++                return self.finalized
++            self._answer = text
++            secs = int(time.time() - self.started)
++            m, s = divmod(secs, 60)
++            time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
++            self._status = f"✍️ 正在回答… · ⏱️ {time_str}"
++            self.render()
++            self._touch()
++            return True
++
++    def push_thinking(self, text: str) -> bool:
++        """推理增量：内部保留全量计数，可见文本只留最近 THINK_MAX 字。"""
++        with self._lock:
++            if not text or not self.open_ok or self.finalized:
++                return self.finalized
++            self._think_total += len(text)
++            self._think = (self._think + text)[-ElementPolicy.THINK_BUFFER_MAX:]
++            secs = int(time.time() - self.started)
++            m, s = divmod(secs, 60)
++            time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
++            self._status = f"🧠 思考中… (已推理 {self._think_total:,} 字) · ⏱️ {time_str}"
++            self.render()
++            self._touch()
++            return True
++
++    def push_tool(self, line: str, *, args: Optional[dict] = None, preview: Optional[str] = None) -> bool:
++        """按序号记录全部工具事件，格式化为专业开发者高密度视图。"""
++        with self._lock:
++            if not line or not self.open_ok or self.finalized:
++                return self.finalized
++            s = str(line).strip()
++            if s:
++                if isinstance(line, ToolCallEntry):
++                    entry = line
++                elif s.startswith("<font") or s.startswith("●") or s.startswith("✅"):
++                    entry = s
++                else:
++                    entry = ToolCallEntry(s, args=args, preview=preview)
++                s = entry
++                self._tool_lines.append(s)
++                self.tool_count = len(self._tool_lines)
++            self.render()
++            self._touch()
++            return True
++
++    def _build_completion_card(self) -> dict:
++        """Build a static inline card for the PATCH overlay (DSH-style ✅ 覆盖)."""
++        def panel(label: str, content: str) -> dict:
++            return {
++                "tag": "collapsible_panel", "expanded": False,
++                "header": {"title": {"tag": "plain_text", "content": label},
++                           "icon": {"tag": "standard_icon", "token": "down-small-ccm_outlined",
++                                    "size": "16px 16px"},
++                           "icon_position": "right", "icon_expanded_angle": -180},
++                "border": {"color": "grey", "corner_radius": "6px"},
++                "padding": "8px 12px 8px 12px",
++                "elements": [{"tag": "markdown", "content": content}],
++            }
++        header_title = f"✅ 回复：{self.title}"
++        think_len = len(self._think.strip()) if self._think else 0
++        think_title = f"思考过程（共 {think_len:,} 字）" if think_len else "思考过程"
++        tool_len = self.tool_count
++        tool_title = f"工具调用（共 {tool_len} 次）" if tool_len else "工具调用"
++        elements = [
++            {"tag": "markdown", "content": self._render_element("status_line", final=True)},
++            {"tag": "hr"},
++            {"tag": "markdown", "content": self._render_element("main_answer", final=True)},
++            panel(think_title, self._render_element("think_text", final=True)),
++            panel(tool_title, self._render_element("tool_text", final=True)),
++        ]
++        # footer：模型 + 思考等级
++        footer_parts = []
++        m = self.model
++        if m:
++            footer_parts.append(f"模型 {m}")
++        if self.reasoning_effort:
++            footer_parts.append(f"思考等级 {self.reasoning_effort}")
++        if footer_parts:
++            elements.append({"tag": "hr"})
++            elements.append({"tag": "markdown",
++                             "content": "<font color='grey'>" + "  ·  ".join(footer_parts) + "</font>"})
++        return {
++            "schema": "2.0",
++            "config": {"wide_screen_mode": True,
++                       "summary": {"content": header_title[:60]}},
++            "header": {"title": {"tag": "plain_text", "content": header_title[:80]},
++                       "template": "green"},
++            "body": {"elements": elements},
++        }
++
++    def finalize(self, model: Optional[str] = None, permission: Optional[str] = None,
++                 iterations: Optional[int] = None) -> bool:
++        """Fill the status line, close streaming_mode, unregister. Idempotent."""
++        with self._lock:
++            if self.finalized or not self.open_ok or not self.card_id:
++                return False
++            if self._timer:
++                self._timer.cancel()
++                self._timer = None
++            if self._heartbeat_timer:
++                try:
++                    self._heartbeat_timer.cancel()
++                except Exception:
++                    pass
++                self._heartbeat_timer = None
++            # 兜底：整轮没收到 is_final 的最终答复时（gateway 某些路径不带 notify），
++            # 用最后一次中间播报补正文，避免封卡时 main_answer 是空的。
++            if not self._answer and self._last_interim:
++                self._answer = self._last_interim
++            secs = int(time.time() - self.started)
++            bits = ["✅ 回合完成"]
++            if model or self.model:
++                bits.append(str(model or self.model))
++            if permission:
++                bits.append(permission)
++            bits.append(f"{secs}s")
++            if iterations:
++                bits.append(f"第 {iterations} 轮")
++            bits.append(f"{self.tool_count} 次工具调用")
++            self._status = "  ·  ".join(bits)
++            # 唯一收尾出口：一次性渲染全部元素的最终态（含诚实空态），跳过节流。
++            self.render(force=True)
++            # 流式窗口已关时 render(force) 走的是整卡 PATCH；这里再强制刷一次，
++            # 保证「✅ 回合完成」状态行与最终正文一定落屏（不受 6s 节流限制）。
++            if self._stream_closed:
++                self._flush_full_card(force=True)
++            obj, code = _api("PATCH", f"/cardkit/v1/cards/{self.card_id}/settings",
++                             {"settings": json.dumps({"config": {"streaming_mode": False}}),
++                              "uuid": str(uuid.uuid4()), "sequence": self._next()})
++            ok = obj.get("code") == 0
++            if not ok:
++                self.last_error = f"settings code={obj.get('code')} {obj.get('msg')}"
++            # ── PATCH overlay：把 CardKit 流式卡原地覆盖成 DSH 式「✅ 回复」完成态 ──
++            # 更新 header title/template → 话题名变成 ✅ 回复：xxx
++            if self.message_id:
++                if model:
++                    self.model = model
++                final_card = self._build_completion_card()
++                pobj, pcode = _api("PATCH", f"/im/v1/messages/{self.message_id}",
++                                   {"msg_type": "interactive",
++                                    "content": json.dumps(final_card, ensure_ascii=False)})
++                patch_ok = pobj.get("code") == 0
++                if not patch_ok:
++                    self.last_error = f"patch_overlay code={pobj.get('code')} {pobj.get('msg')}"
++                _log("patch_overlay", scope=self.scope, ok=patch_ok, http=pcode)
++
++                # ── 话题完成推送通知（触发飞书移动端/桌面端消息通知与 ✅ 标示） ──
++                # 只有真实的回复回合才需要弹通知（不打扰普通控制流）
++                target_mid = self.message_id or self.reply_to
++                if target_mid:
++                    finish_parts = [f"✅ 回复已完成 ({secs}s)"]
++                    if self.model or model:
++                        finish_parts.append(f"模型: `{self.model or model}`")
++                    if self.reasoning_effort:
++                        finish_parts.append(f"思考: `{self.reasoning_effort}`")
++                    if self.tool_count:
++                        finish_parts.append(f"{self.tool_count}次工具")
++                    finish_text = " · ".join(finish_parts)
++                    try:
++                        nobj, ncode = _api("POST", f"/im/v1/messages/{target_mid}/reply",
++                                           {"msg_type": "text",
++                                            "content": json.dumps({"text": finish_text}, ensure_ascii=False),
++                                            "reply_in_thread": True})
++                        _log("finish_notification", scope=self.scope, ok=(nobj.get("code") == 0), http=ncode)
++                    except Exception as e:
++                        _log("finish_notification_err", scope=self.scope, err=str(e))
++            # 全部写入完成后再置位：并发推流不会挤进半个收尾。
++            self.finalized = True
++            _log("finalize", scope=self.scope, secs=secs,
++                 answer_len=len(self._answer), tools=self.tool_count)
++            deactivate(self)
++            return ok
++
++
++def ensure(chat_id: str, *, reply_to: Optional[str] = None,
++           thread_id: Optional[str] = None, session_key: Optional[str] = None,
++           title: Optional[str] = None,
++           title_hint: Optional[str] = None,
++           model: Optional[str] = None,
++           reasoning_effort: Optional[str] = None) -> Optional["CardKitStream"]:
++    """Turn-scoped entry point, called once per turn from the gateway runner.
++
++    Finalizes any stale card left by a hard-interrupted previous turn (sealing the
++    half-card), then opens + registers a fresh one. Every later tee (reasoning /
++    tool / answer) reuses it via ``get_active(chat_id)``. Returns the active stream
++    or None on failure (never raises into the gateway).
++    """
++    if not enabled():
++        return None
++    try:
++        # 只回收 *同一 scope* 的半截卡，不再 finalize 整个 chat 的其它话题卡片。
++        with _ACTIVE_LOCK:
++            old = _ACTIVE.get(_scope(chat_id, thread_id, session_key))
++        if old is not None and not old.finalized:
++            try:
++                old.finalize()
++            except Exception:
++                deactivate(old)
++        ck = CardKitStream(chat_id, title=title, reply_to=reply_to,
++                           thread_id=thread_id, session_key=session_key,
++                           title_hint=title_hint)
++        if model:
++            ck.model = model
++        if reasoning_effort:
++            ck.reasoning_effort = reasoning_effort
++        if ck.open():
++            return ck
++        return None
++    except Exception:
++        return None
++
++
++def on_send(chat_id: str, content: str, *, reply_to: Optional[str] = None,
++            thread_id: Optional[str] = None,
++            session_key: Optional[str] = None,
++            is_final: bool = False) -> Optional[str]:
++    """Adapter ``send()`` hook.
++
++    2026-11-07 修：gateway streaming ON 时 send() 会被三类「非最终答复」调用——
++      * stream_consumer 的首次发送（_first_send，此时还没走过 edit_message）
++      * 段间播报 / interim
++      * 长任务心跳「⏳ Working — N min」的首次 send
++    原实现见到 send 且 _streamed=False 就 _seal_soon() 封卡，实机 181s 封卡、
++    turn 实跑 640s，之后所有 thinking/tool/answer 全溢出卡外。
++    现在 streaming ON 时 send 一律不封卡：心跳写状态行，其它进思考框；
++    封卡只由 on_edit(is_turn_final=True) 负责。streaming OFF 保持原语义。
++    """
++    if not enabled():
++        return None
++    ck = get_active(chat_id, thread_id=thread_id, session_key=session_key)
++    if ck is None or ck.finalized:
++        # 豆花防溢出兜底（2026-11-08）：如果本轮卡片已被提前误封，但同一 scope 刚发过卡片，
++        # 绝不让最终文本溢出成外部 post 独立气泡！直接通过 PATCH 把内容更新进卡片正文！
++        stale_ck = None
++        with _ACTIVE_LOCK:
++            target_scope = _scope(chat_id, thread_id, session_key)
++            cand = _ACTIVE.get(target_scope) or _RECENT_CARDS.get(target_scope)
++            if cand and cand.message_id:
++                stale_ck = cand
++            else:
++                for a, sc in list(_ALIASES.items()):
++                    if sc == target_scope:
++                        cand = _ACTIVE.get(sc) or _RECENT_CARDS.get(sc)
++                        if cand and cand.message_id:
++                            stale_ck = cand
++                            break
++        if stale_ck and stale_ck.message_id and is_final:
++            try:
++                stale_ck._answer = (stale_ck._answer + "\n\n" + content).strip() if stale_ck._answer else content
++                final_card = stale_ck._build_completion_card()
++                _api("PATCH", f"/im/v1/messages/{stale_ck.message_id}",
++                     {"msg_type": "interactive", "content": json.dumps(final_card, ensure_ascii=False)})
++                _log("on_send_revive_patch", scope=target_scope, chars=len(content))
++                return stale_ck.message_id
++            except Exception:
++                pass
++        return None
++    ck._streamed = True
++    heartbeat = content.lstrip().startswith("⏳ Working")
++    if heartbeat:
++        # 长任务心跳：只刷状态行，别覆盖正文，更不封卡。
++        ck.set_status(content)
++        ck._touch()
++        _log("on_send", kind="heartbeat", scope=ck.scope, chars=len(content))
++        return ck.message_id
++    if not is_final:
++        # 2026-11-07 修（第五次反馈）：工具之间的中间播报 / 首帧预览不是最终答复。
++        # 原实现把它们也写 main_answer，35 分钟长任务期间正文被 16~45 字短句
++        # 反复冲刷，用户看到的永远是中间文本而非结论。现在只当进度写状态行。
++        ck._last_interim = content
++        ck.set_status("⏳ " + content.strip().splitlines()[0][:60])
++        ck._touch()
++        _log("on_send", kind="interim", scope=ck.scope, chars=len(content),
++             answer_len=len(ck._answer))
++        return ck.message_id
++    if content.lstrip().startswith("↪"):
++        # busy_input_mode=interrupt 的 redirect 提示（"↪ Redirected current run"）
++        # 也带 notify，原实现把它当最终答复写正文并立刻封卡，卡片死在 18 字。
++        ck.set_status("⏳ " + content.strip()[:60])
++        ck._touch()
++        _log("on_send", kind="redirect_note", scope=ck.scope, chars=len(content))
++        return ck.message_id
++    # 最终答复：唯一写 main_answer 的 send 路径（gateway metadata.notify=True）。
++    ok = ck.push_answer(content)
++    _log("on_send", kind="answer", scope=ck.scope, chars=len(content),
++         wrote=ok, is_final=True, streaming=_streaming_on(),
++         answer_len=len(ck._answer))
++    # 最终答复一到就短延迟封卡，不再等 IDLE 兜底定时器（实测 3~6 分钟后才
++    # 显示「✅ 回合完成」，用户以为卡片卡住）。同时 force 刷思考/工具最终态。
++    if _streaming_on():
++        _seal_soon(ck, delay=3.5)
++    else:
++        _seal_soon(ck)
++    return ck.message_id
++
++
++def on_edit(chat_id: str, content: str, *, finalize: bool = False,
++            is_turn_final: bool = False,
++            message_id: Optional[str] = None, thread_id: Optional[str] = None,
++            session_key: Optional[str] = None) -> bool:
++    """Adapter ``edit_message()`` hook (gateway streaming ON: accumulated text).
++
++    Returns True so the caller skips its own edit. ``finalize=True`` (the stream
++    consumer's turn-final edit) seals the card after a short delay.
++    """
++    if not enabled():
++        return False
++    ck = get_active(chat_id, thread_id=thread_id, session_key=session_key,
++                    message_id=message_id)
++    if ck is None or ck.finalized:
++        return False
++    ck._streamed = True
++    # 长任务心跳（"⏳ Working — N min …"）写状态行，别覆盖正文。
++    if content.lstrip().startswith("⏳ Working"):
++        ck.set_status(content)
++    else:
++        ck.push_answer(content)
++    # finalize=True 只是「这段消息不再编辑」：工具边界 / 段落封版 / 长文拆块都会触发，
++    # 一轮内可能发生多次。只有 is_turn_final 才是真正的回合结束（2026-11-07 修：
++    # 原实现见到 finalize 就封卡，第一次工具边界就把卡封死，后续内容全溢出卡外）。
++    _log("on_edit", scope=ck.scope, chars=len(content), finalize=finalize,
++         is_turn_final=is_turn_final, answer_len=len(ck._answer))
++    if is_turn_final:
++        _seal_soon(ck)
++    return True
++
++
++def _seal_soon(ck: "CardKitStream", delay: float = 2.5) -> None:
++    """Seal after the typewriter renders the tail. Can be cancelled by subsequent activity."""
++    with ck._lock:
++        if ck.finalized:
++            return
++        if ck._seal_timer is not None:
++            try:
++                ck._seal_timer.cancel()
++            except Exception:
++                pass
++            ck._seal_timer = None
++
++        def _do():
++            try:
++                ck.finalize()
++            except Exception:
++                pass
++
++        try:
++            t = threading.Timer(delay, _do)
++            t.daemon = True
++            ck._seal_timer = t
++            t.start()
++        except Exception:
++            _do()
++
++
++def on_tool(chat_id: str, line: str, *, thread_id: Optional[str] = None,
++            session_key: Optional[str] = None, args: Optional[dict] = None,
++            preview: Optional[str] = None) -> bool:
++    """Progress tee: append a real tool.started line into the 工具调用 panel.
++
++    Returns True when the card took the line (so the caller suppresses the
++    out-of-card progress bubble); False otherwise (original progress path runs).
++    """
++    if not line or not enabled():
++        return False
++    ck = get_active(chat_id, thread_id=thread_id, session_key=session_key)
++    if ck is None or ck.finalized:
++        return False
++    try:
++        ok = ck.push_tool(line, args=args, preview=preview)
++        _log("on_tool", scope=ck.scope, tool=str(line)[:60], wrote=ok)
++        return ok
++    except Exception:
++        return False
++
++
++
++def on_thinking(chat_id: str, text: str, *, thread_id: Optional[str] = None,
++                session_key: Optional[str] = None) -> bool:
++    """Reasoning / <think> delta -> 「思考过程」折叠框 (2026-11-07).
++
++    接的是 agent.reasoning_callback 的真实流式增量（原生 reasoning 与内联 <think> 块），
++    不伪造内容；整轮没有推理流时 finalize() 会写诚实空态。
++    """
++    if not text or not enabled():
++        return False
++    ck = get_active(chat_id, thread_id=thread_id, session_key=session_key)
++    if ck is None or ck.finalized:
++        return False
++    try:
++        ok = ck.push_thinking(text)
++        _log("on_thinking", scope=ck.scope, chars=len(text),
++             total=ck._think_total, visible=len(ck._think))
++        return ok
++    except Exception:
++        return False
+diff --git a/plugins/platforms/feishu/feishu_setup_cards.py b/plugins/platforms/feishu/feishu_setup_cards.py
+new file mode 100644
+index 0000000000..4f06a32e15
+--- /dev/null
++++ b/plugins/platforms/feishu/feishu_setup_cards.py
+@@ -0,0 +1,374 @@
++"""Feishu Card 2.0 setup cards for /new and /model (豆花 2026-11-09 重写).
++
++Model lists are NOT hardcoded. The single source is Hermes' own picker catalog
++(``hermes_cli.model_switch_providers.list_picker_providers``) — the same call the
++gateway makes for the native /model picker. A provider or model added to
++config.yaml / exposed by an endpoint's /models shows up here with no code change.
++
++Card rules:
++- Channel tabs (buttons) outside the form; clicking one re-renders the card with
++  that channel's models only (Feishu form selects send no change events).
++- Model option values carry their provider (``<slug>::<model>``), so a submit
++  always knows which channel the chosen model belongs to.
++- Aggregators (OpenRouter / Nous) are reduced to one newest entry per model
++  family, keeping their own curated order. No fixed name list is involved.
++"""
++from __future__ import annotations
++
++import logging
++import re
++import threading
++import time
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++REASONING_OPTIONS = [
++    {"text": {"tag": "plain_text", "content": "ultra (极限推理)"}, "value": "ultra"},
++    {"text": {"tag": "plain_text", "content": "xhigh (极高)"}, "value": "xhigh"},
++    {"text": {"tag": "plain_text", "content": "high (高)"}, "value": "high"},
++    {"text": {"tag": "plain_text", "content": "medium (中)"}, "value": "medium"},
++    {"text": {"tag": "plain_text", "content": "low (低)"}, "value": "low"},
++    {"text": {"tag": "plain_text", "content": "minimal (微量)"}, "value": "minimal"},
++    {"text": {"tag": "plain_text", "content": "none (关闭思考)"}, "value": "none"},
++    {"text": {"tag": "plain_text", "content": "reset (恢复默认)"}, "value": "reset"},
++]
++
++AGGREGATOR_SLUGS = {"openrouter", "custom:openrouter", "nous"}
++AGGREGATOR_MAX = 30        # flagship rows kept per aggregator
++CHANNEL_MAX_MODELS = 80    # hard cap per dropdown (card element budget is 200)
++OPTION_SEP = "::"
++_HIDDEN_SLUGS = {"moa"}    # MoA needs the native picker's own flow
++_LABEL_HINTS = {"dashscope": "阿里云百炼"}  # cosmetic only; unknown slugs use catalog name
++
++# Endpoints that are not chat models (TTS/ASR/embedding/image) break an agent turn.
++_NON_CHAT = re.compile(r"(?:^|[-_/.])(?:tts|asr|realtime|embed\w*|rerank\w*|whisper|"
++                       r"speech|transcri\w*|moderation|audio|image\w*|dall-e)(?:$|[-_/.:])",
++                       re.I)
++_VARIANT = re.compile(r"(?::(?:free|batch|beta|extended|thinking)$)|"
++                      r"(?:-(?:fast|flex|batch)$)|^~", re.I)
++_SNAPSHOT = re.compile(r"-(?:\d{4}|\d{6}|\d{8}|\d{4}-\d{2}-\d{2})$")
++_VERSION = re.compile(r"v?\d+(?:\.\d+)*")
++
++# ── catalog cache ──────────────────────────────────────────────────────────
++# Card callbacks must answer Feishu within ~3 s, so they read this cache only.
++# It is filled by the gateway's /model picker call and by load_catalog().
++_CATALOG_TTL = 600.0
++_CATALOG: dict[str, Any] = {"providers": None, "at": 0.0}
++_CATALOG_LOCK = threading.Lock()
++
++
++def remember_catalog(providers: Optional[list]) -> None:
++    """Store a provider list produced by Hermes' picker catalog."""
++    if providers:
++        with _CATALOG_LOCK:
++            _CATALOG["providers"] = list(providers)
++            _CATALOG["at"] = time.time()
++
++
++def cached_catalog(max_age: Optional[float] = None) -> Optional[list]:
++    """Last remembered catalog (any age unless *max_age* is given)."""
++    with _CATALOG_LOCK:
++        provs, at = _CATALOG["providers"], _CATALOG["at"]
++    if provs is None or (max_age is not None and time.time() - at > max_age):
++        return None
++    return provs
++
++
++def load_catalog(current_provider: str = "", current_model: str = "",
++                 force: bool = False) -> list:
++    """Blocking read of Hermes' picker catalog (disk-cached catalogs, no live probes).
++
++    Call from a worker thread (``asyncio.to_thread``); never from a card callback.
++    """
++    if not force:
++        fresh = cached_catalog(max_age=_CATALOG_TTL)
++        if fresh is not None:
++            return fresh
++    try:
++        from hermes_cli.config import load_config_readonly
++        from hermes_cli.model_switch_providers import list_picker_providers
++        cfg = load_config_readonly() or {}
++        try:
++            from hermes_cli.config import get_compatible_custom_providers
++            custom = get_compatible_custom_providers(cfg)
++        except Exception:
++            custom = cfg.get("custom_providers")
++        raw_model_cfg = cfg.get("model")
++        model_cfg: dict = raw_model_cfg if isinstance(raw_model_cfg, dict) else {}
++        provs = list_picker_providers(
++            current_provider=current_provider or model_cfg.get("provider") or "",
++            current_base_url=model_cfg.get("base_url") or "",
++            current_model=current_model or model_cfg.get("default") or "",
++            user_providers=cfg.get("providers"), custom_providers=custom,
++            excluded_providers=(cfg.get("model_catalog") or {}).get("excluded_providers"),
++            max_models=None, include_moa=False, non_blocking_catalogs=True,
++            probe_custom_providers=False, probe_current_custom_provider=True,
++        )
++    except Exception as exc:
++        logger.warning("[Feishu] model catalog load failed: %s", exc, exc_info=True)
++        return cached_catalog() or []
++    remember_catalog(provs)
++    return provs
++
++
++def catalog_is_truncated(providers: Optional[list]) -> bool:
++    """True when a non-aggregator row was capped (gateway passes max_models=50)."""
++    for p in providers or []:
++        slug = str(p.get("slug") or "")
++        total = p.get("total_models")
++        if slug not in AGGREGATOR_SLUGS and isinstance(total, int) and total > len(p.get("models") or []):
++            return True
++    return False
++
++
++# ── normalisation ──────────────────────────────────────────────────────────
++def _family_key(model_id: str) -> str:
++    """Collapse version numbers and date snapshots: newest-first lists keep the first hit."""
++    base = _SNAPSHOT.sub("", model_id.lower())
++    return _VERSION.sub("#", base)
++
++
++def _flagship_filter(models: list[str]) -> list[str]:
++    """One entry per model family, preserving the aggregator's own curated order."""
++    out, seen = [], set()
++    for m in models:
++        if _VARIANT.search(m):
++            continue
++        fam = _family_key(m)
++        if fam in seen:
++            continue
++        seen.add(fam)
++        out.append(m)
++        if len(out) >= AGGREGATOR_MAX:
++            break
++    return out
++
++
++def normalize_channels(providers: Optional[list] = None) -> list[dict[str, Any]]:
++    """Catalog rows → ``[{slug, name, models, aggregator, current}]`` for the card."""
++    rows = providers if providers else (cached_catalog() or [])
++    slugs = {str(p.get("slug") or "") for p in rows}
++    out: list[dict[str, Any]] = []
++    for p in rows:
++        slug = str(p.get("slug") or "")
++        if not slug or slug in _HIDDEN_SLUGS:
++            continue
++        if slug == "custom:openrouter" and "openrouter" in slugs:
++            continue  # same service twice; the native row carries the curated list
++        models = [str(m.get("id") if isinstance(m, dict) else m) for m in (p.get("models") or [])]
++        models = [m for m in models if m and not _NON_CHAT.search(m)]
++        aggregator = slug in AGGREGATOR_SLUGS
++        models = _flagship_filter(models) if aggregator else models[:CHANNEL_MAX_MODELS]
++        if not models:
++            continue
++        out.append({"slug": slug, "name": str(p.get("name") or slug), "models": models,
++                    "aggregator": aggregator, "current": bool(p.get("is_current"))})
++    return out
++
++
++def find_channel(slug: Optional[str], channels: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
++    for ch in channels:
++        if ch["slug"] == slug:
++            return ch
++    return None
++
++
++def get_channel_label(provider: Optional[str], channels: Optional[list] = None) -> str:
++    """Display name: cosmetic hint > catalog name > slug."""
++    if provider in _LABEL_HINTS:
++        return _LABEL_HINTS[provider]
++    ch = find_channel(provider, channels if channels is not None else normalize_channels())
++    return ch["name"] if ch else (provider or "默认渠道")
++
++
++def pick_channel(provider: Optional[str], channels: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
++    """Requested channel, else the catalog's current one, else the first."""
++    return (find_channel(provider, channels)
++            or next((c for c in channels if c["current"]), None)
++            or (channels[0] if channels else None))
++
++
++def default_model_for(provider: Optional[str], channels: Optional[list] = None,
++                      current_model: Optional[str] = None) -> str:
++    """Keep *current_model* when the channel lists it, else the channel's first model."""
++    chs = channels if channels is not None else normalize_channels()
++    ch = find_channel(provider, chs)
++    if ch is None:
++        return current_model or ""
++    if current_model and current_model in ch["models"]:
++        return current_model
++    return ch["models"][0]
++
++
++def encode_option(slug: str, model: str) -> str:
++    return f"{slug}{OPTION_SEP}{model}"
++
++
++def decode_option(value: Optional[str], fallback_provider: str = "") -> tuple[str, str]:
++    """``slug::model`` → (slug, model); a bare model keeps *fallback_provider*."""
++    value = str(value or "").strip()
++    if OPTION_SEP in value:
++        slug, model = value.split(OPTION_SEP, 1)
++        return slug.strip(), model.strip()
++    return fallback_provider, value
++
++
++def reasoning_effort_value(reasoning: Any) -> Optional[str]:
++    """``{'enabled': False}`` → 'none'; ``{'effort': 'high'}`` / 'high' → 'high'."""
++    if isinstance(reasoning, dict):
++        if reasoning.get("enabled") is False:
++            return "none"
++        return reasoning.get("effort") or None
++    return str(reasoning).strip().lower() or None if reasoning else None
++
++
++# ── option builders ────────────────────────────────────────────────────────
++def _opt(text: str, value: str) -> dict[str, Any]:
++    return {"text": {"tag": "plain_text", "content": text[:60]}, "value": value}
++
++
++def get_model_options(selected_model: Optional[str], channel: Optional[dict[str, Any]],
++                      *, include_current: Optional[bool] = None) -> list[dict[str, Any]]:
++    """Dropdown rows for ONE channel; values are ``slug::model``.
++
++    ``selected_model`` is the row that will be submitted if the user does not touch the
++    dropdown — it gets the ✓ mark. ``include_current`` defaults to "selected_model is not in
++    the channel list" (the session's live model stays selectable even if the catalog lacks it).
++    """
++    if channel is None:
++        return []
++    slug, models = channel["slug"], list(channel["models"])
++    if include_current is None:
++        include_current = bool(selected_model) and selected_model not in models
++    if include_current and selected_model and selected_model not in models:
++        models.insert(0, selected_model)
++    return [_opt(f"✓ {m}" if m == selected_model else m, encode_option(slug, m)) for m in models]
++
++
++def _reasoning_options(current: Optional[str]) -> list[dict[str, Any]]:
++    out = []
++    for opt in REASONING_OPTIONS:
++        val, txt = opt["value"], opt["text"]["content"]
++        out.append(_opt(f"✓ {txt}" if val == current else txt, val))
++    return out
++
++
++def _channel_buttons(channels: list[dict[str, Any]], active: str, card_type: str, *,
++                     chat_id: str = "", session_key: str = "", topic_name: str = "",
++                     reasoning: str = "") -> list[dict[str, Any]]:
++    btns = []
++    for ch in channels:
++        is_cur = ch["slug"] == active
++        label = f"{get_channel_label(ch['slug'], channels)} ({len(ch['models'])})"
++        btns.append({
++            "tag": "button",
++            "text": {"tag": "plain_text", "content": ("✓ " if is_cur else "") + label},
++            "type": "primary" if is_cur else "default",
++            "width": "fill",
++            "name": f"btn_chan_{re.sub(r'[^A-Za-z0-9_]', '_', ch['slug'])}"[:60],
++            "value": {"hermes_feishu_form_action": "select_channel", "provider": ch["slug"],
++                      "card_type": card_type, "chat_id": chat_id, "session_key": session_key,
++                      "topic_name": topic_name, "reasoning": reasoning},
++        })
++    return btns
++
++
++# ── card builders ──────────────────────────────────────────────────────────
++def _setup_card(*, card_type: str, header: str, intro: str, current_model: Optional[str],
++                current_reasoning: Any, current_provider: Optional[str], providers: Optional[list],
++                chat_id: str = "", session_key: str = "", topic_name: str = "",
++                view_provider: Optional[str] = None) -> dict[str, Any]:
++    channels = normalize_channels(providers)
++    ch = pick_channel(view_provider or current_provider, channels)
++    slug = ch["slug"] if ch else (view_provider or current_provider or "")
++    # The session's model is only "current" inside the channel it actually runs on.
++    live_model = current_model if ch and (view_provider or current_provider) == slug else None
++    # 会话正在用的模型：只有它属于本渠道时才当作「当前项」，否则用本渠道第一个模型
++    in_channel = bool(ch and live_model and live_model in ch["models"])
++    active_m = (live_model if in_channel else default_model_for(slug, channels)) if ch else (live_model or "")
++    effort = reasoning_effort_value(current_reasoning)
++    model_opts = get_model_options(active_m, ch, include_current=bool(live_model) and not in_channel)
++    btns = _channel_buttons(channels, slug, card_type, chat_id=chat_id, session_key=session_key,
++                            topic_name=topic_name, reasoning=effort or "")
++    half = (len(btns) + 1) // 2
++    lbl = get_channel_label(slug, channels)
++
++    form: list[dict[str, Any]] = []
++    if card_type == "new_topic":
++        form.append({"tag": "input", "name": "topic_name", "required": False,
++                     "default_value": topic_name or "",
++                     "placeholder": {"tag": "plain_text", "content": "话题名称（如：量化计算）"}})
++    if model_opts:
++        selected = encode_option(slug, active_m or "")
++        form.append({"tag": "select_static", "name": "model_select", "options": model_opts,
++                     "initial_option": selected,
++                     "placeholder": {"tag": "plain_text", "content": f"{lbl} 的模型"}})
++    reasoning_sel = {"tag": "select_static", "name": "reasoning_select",
++                     "options": _reasoning_options(effort),
++                     "placeholder": {"tag": "plain_text", "content": "思考等级（默认）"}}
++    if effort in {o["value"] for o in REASONING_OPTIONS}:
++        reasoning_sel["initial_option"] = effort  # never send null: Feishu rejects it
++    form.append(reasoning_sel)
++    submit_name = "submit_new_topic" if card_type == "new_topic" else "submit_model_switch"
++    form.append({"tag": "button", "type": "primary", "form_action_type": "submit",
++                 "name": submit_name,
++                 "text": {"tag": "plain_text",
++                          "content": "创建话题" if card_type == "new_topic" else "确认切换"},
++                 "value": {"hermes_feishu_form_action": card_type, "chat_id": chat_id,
++                           "session_key": session_key, "provider": slug}})
++
++    elements: list[dict[str, Any]] = [{"tag": "markdown", "content": intro}]
++    if btns:
++        elements.append({"tag": "column_set", "flex_mode": "none", "background_style": "grey",
++                         "columns": [{"tag": "column", "width": "weighted", "weight": 1,
++                                      "elements": btns[:half]},
++                                     {"tag": "column", "width": "weighted", "weight": 1,
++                                      "elements": btns[half:]}]})
++    else:
++        elements.append({"tag": "markdown",
++                         "content": "<font color='red'>未读到任何可用渠道，请检查 config.yaml 的 providers。</font>"})
++    elements += [{"tag": "hr"}, {"tag": "form", "name": f"{card_type}_form", "elements": form}]
++    return {"schema": "2.0",
++            "header": {"title": {"tag": "plain_text", "content": header}, "template": "blue"},
++            "body": {"elements": elements}}
++
++
++def build_new_topic_card(current_model: Optional[str] = None, current_reasoning: Any = None,
++                         current_provider: Optional[str] = None, chat_id: Optional[str] = None,
++                         providers: Optional[list] = None,
++                         topic_name_init: Optional[str] = None,
++                         view_provider: Optional[str] = None) -> dict[str, Any]:
++    """/new: topic name + in-channel model + reasoning."""
++    return _setup_card(
++        card_type="new_topic", header="新建话题",
++        intro="**选择渠道**（按钮切换后，下方只列该渠道的模型）",
++        current_model=current_model, current_reasoning=current_reasoning,
++        current_provider=current_provider, providers=providers,
++        chat_id=chat_id or "", topic_name=topic_name_init or "",
++        view_provider=view_provider)
++
++
++def build_model_switch_card(current_model: Optional[str] = None, current_reasoning: Any = None,
++                            current_provider: Optional[str] = None,
++                            session_key: Optional[str] = None,
++                            providers: Optional[list] = None,
++                            view_provider: Optional[str] = None) -> dict[str, Any]:
++    """/model: shows what the session runs NOW, then the in-channel picker."""
++    channels = normalize_channels(providers)
++    effort = reasoning_effort_value(current_reasoning) or "默认"
++    intro = (f"**当前生效**：`{current_model or '默认'}` · "
++             f"{get_channel_label(current_provider, channels)} · 思考 `{effort}`\n"
++             "**选择渠道**（按钮切换后，下方只列该渠道的模型）")
++    return _setup_card(
++        card_type="switch_model", header="切换模型与思考等级", intro=intro,
++        current_model=current_model, current_reasoning=current_reasoning,
++        current_provider=current_provider, providers=providers, session_key=session_key or "",
++        view_provider=view_provider)
++
++
++def build_settled_card(title: str, message: str, template: str = "green") -> dict[str, Any]:
++    """Result card shown in place of the form after a submit."""
++    return {"schema": "2.0",
++            "header": {"title": {"tag": "plain_text", "content": title[:80]}, "template": template},
++            "body": {"elements": [{"tag": "markdown", "content": message}]}}
+diff --git a/plugins/platforms/feishu/feishu_thread_reply.py b/plugins/platforms/feishu/feishu_thread_reply.py
+new file mode 100644
+index 0000000000..007726716e
+--- /dev/null
++++ b/plugins/platforms/feishu/feishu_thread_reply.py
+@@ -0,0 +1,97 @@
++"""Feishu topic-thread (话题) reply routing extracted from the adapter facade.
++
++Everything about *where a reply lands relative to Feishu topics* lives here:
++
++* ``send_threaded_reply`` — anchored reply with the ``FEISHU_THREAD_REPLY`` upgrade,
++  and the plain-quote degrade when the group rejects the topic form (230071/230072).
++* ``wants_thread_reply`` — the group-chat gate: DMs never thread.
++* ``fetch_last_message_in_thread`` — reply-anchor lookup for topic sends without one.
++
++The module takes the adapter as data; it must not import the facade at module level
++(the facade late-imports these by topic inside its methods — see adapter.py).
++"""
++
++from __future__ import annotations
++
++import logging
++import uuid
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++# Feishu rejects a topic-form reply when the group settings disallow threads (230071)
++# or the anchor message is aggregated (230072) — the answer must still land, so it is
++# retried once as a plain quoted reply (the pre-toggle behavior).
++_THREAD_UNSUPPORTED_CODES = frozenset({230071, 230072})
++
++
++async def send_threaded_reply(
++    adapter: Any, *, chat_id: str, msg_type: str, payload: str, reply_to: str, metadata: Optional[dict[str, Any]],
++) -> Any:
++    """Reply anchored on ``reply_to``, upgraded to a topic when the toggle demands it.
++
++    Feishu spawns the topic on the FIRST ``reply_in_thread=true`` reply to a threadless
++    group message; continuation chunks anchored on the same message join it. A group that
++    rejects the topic form degrades to a plain quote instead of dropping the reply.
++    """
++    thread_id = (metadata or {}).get("thread_id")
++    reply_in_thread = bool(thread_id) or await wants_thread_reply(adapter, chat_id)
++    response = await _reply(adapter, reply_to=reply_to, msg_type=msg_type, payload=payload, thread=reply_in_thread)
++    if reply_in_thread and not adapter._response_succeeded(response):
++        code = getattr(response, "code", None)
++        if code in _THREAD_UNSUPPORTED_CODES:
++            logger.info(
++                "[Feishu] Topic reply to %s rejected in chat %s (code %s — group settings or aggregated "
++                "anchor); falling back to plain quote", reply_to, chat_id, code,
++            )
++            response = await _reply(adapter, reply_to=reply_to, msg_type=msg_type, payload=payload, thread=False)
++    return response
++
++
++async def _reply(adapter: Any, *, reply_to: str, msg_type: str, payload: str, thread: bool) -> Any:
++    body = adapter._build_reply_message_body(
++        content=payload, msg_type=msg_type, reply_in_thread=thread, uuid_value=str(uuid.uuid4()),
++    )
++    request = adapter._build_reply_message_request(reply_to, body)
++    return await adapter._run_blocking(adapter._client.im.v1.message.reply, request)
++
++
++async def wants_thread_reply(adapter: Any, chat_id: str) -> bool:
++    """FEISHU_THREAD_REPLY gates on group chats; FEISHU_DM_TOPIC_REPLY additionally
++    enables topic replies in DMs (豆花本地补丁，原 PR 假设 DM 无话题，与飞书实际不符).
++
++    The chat-info cache is warm by the time a reply goes out (the inbound that triggered
++    the turn fills it via ``get_chat_info``), so this is a dict hit on the hot path; a
++    cold lookup degrades to ``"dm"`` (plain quoted reply) if the API call fails.
++    """
++    from gateway.platforms._shared import get_scoped_secret
++    if not getattr(adapter, "_thread_reply", False):
++        return False
++    # 注意：Hermes 的 secrets 位于 profile secret scope，不在进程 os.environ
++    dm_val = str(get_scoped_secret("FEISHU_DM_TOPIC_REPLY", "false") or "false").strip().lower()
++    dm_enabled = dm_val in ("1", "true", "yes")
++    if dm_enabled:
++        # DM 话题开关打开：群聊和私聊都允许建话题（DSH 实测 DM 话题存在）
++        return True
++    # 原 PR 行为：只在群聊/话题群生效
++    if chat_id.startswith("feishu_user_id:") or chat_id.startswith("ou_"):
++        return False
++    info = await adapter.get_chat_info(chat_id)
++    return info.get("type") in {"group", "forum"}
++
++
++async def fetch_last_message_in_thread(adapter: Any, thread_id: str) -> Optional[str]:
++    """Fetch the last message_id in a thread for reply-based routing."""
++    if not adapter._client or not thread_id:
++        return None
++    try:
++        from lark_oapi.api.im.v1 import ListMessageRequest
++        request = ListMessageRequest.builder().container_id_type("thread").container_id(thread_id).page_size(1).build()
++        response = await adapter._run_blocking(adapter._client.im.v1.message.list, request)
++        if adapter._response_succeeded(response):
++            items = getattr(getattr(response, "data", None), "items", None)
++            if items and len(items) > 0:
++                return getattr(items[0], "message_id", None)
++    except Exception as exc:
++        logger.debug("[Feishu] Failed to fetch last message in thread %s: %s", thread_id, exc, exc_info=True)
++    return None
+diff --git a/plugins/platforms/feishu/plugin.yaml b/plugins/platforms/feishu/plugin.yaml
+index 0eabd947ea..75d9b3587b 100644
+--- a/plugins/platforms/feishu/plugin.yaml
++++ b/plugins/platforms/feishu/plugin.yaml
+@@ -34,6 +34,14 @@ optional_env:
+     description: "Allow any Feishu user to trigger the bot (dev only)"
+     prompt: "Allow all users? (true/false)"
+     password: false
++  - name: FEISHU_THREAD_REPLY
++    description: "Reply inside a topic thread (reply_in_thread) for group-chat messages"
++    prompt: "Reply in group topics? (true/false)"
++    password: false
++  - name: FEISHU_DM_TOPIC_REPLY
++    description: "Local patch: also spawn topic threads for direct messages (DM chat_id). Requires FEISHU_THREAD_REPLY=true"
++    prompt: "Open a topic thread for DM replies? (true/false)"
++    password: false
+   - name: FEISHU_HOME_CHANNEL
+     description: "Default chat ID for cron / notification delivery"
+     prompt: "Home channel ID"
+diff --git a/tests/gateway/test_cardkit_scope.py b/tests/gateway/test_cardkit_scope.py
+new file mode 100644
+index 0000000000..1f1b1c5004
+--- /dev/null
++++ b/tests/gateway/test_cardkit_scope.py
+@@ -0,0 +1,576 @@
++"""CardKit 会话分槽 / 标题对齐 / 思考流 回归测试（豆花本机补丁 2026-11-07）。
++
++离线：mock 掉 _api 与 state.db，不发任何飞书消息。
++覆盖三条修复：
++  1. 标题按 session_key 精确取，不再按 chat_id 取「最近一条」串台；
++  2. 不同 session 的卡片互不 finalize（原 chat_id 单槽会互相踢掉）；
++  3. reasoning/<think> delta 能进「思考过程」折叠框，且 on_edit 按 message_id 定位卡。
++"""
++from __future__ import annotations
++
++import importlib.util
++import sqlite3
++import sys
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++CK_PATH = ROOT / "plugins" / "platforms" / "feishu" / "cardkit.py"
++
++# 与 state.db 里真实格式一致（gateway 按 thread_id 派生）
++SKEY_A = "agent:main:feishu:dm:chatA:sess1"
++SKEY_B = "agent:main:feishu:dm:chatA:sess2"
++
++
++def _load():
++    name = "_hermes_cardkit_test"
++    spec = importlib.util.spec_from_file_location(name, str(CK_PATH))
++    assert spec is not None and spec.loader is not None, "cardkit.py 加载失败"
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++@pytest.fixture()
++def ck(tmp_path, monkeypatch):
++    mod = _load()
++    mod._ACTIVE.clear()
++    mod._ALIASES.clear()
++
++    calls: list = []
++
++    def fake_api(method, path, body=None, params=None):
++        calls.append((method, path, body))
++        if method == "POST" and path == "/cardkit/v1/cards":
++            return {"code": 0, "data": {"card_id": f"card_{len(calls)}"}}, 200
++        if method == "POST" and path.startswith("/im/v1/messages"):
++            return {"code": 0, "data": {"message_id": f"msg_{len(calls)}"}}, 200
++        return {"code": 0}, 200
++
++    monkeypatch.setattr(mod, "_api", fake_api)
++    monkeypatch.setattr(mod, "enabled", lambda: True)
++
++    db = tmp_path / "state.db"
++    con = sqlite3.connect(db)
++    con.execute(
++        "create table sessions (session_key text, thread_id text, chat_id text, "
++        "title text, last_activity_at real)"
++    )
++    con.executemany(
++        "insert into sessions values (?,?,?,?,?)",
++        [
++            (SKEY_A, "omt_1", "chatA", "会话甲的标题", 1.0),
++            (SKEY_B, "omt_2", "chatA", "会话乙的标题", 2.0),
++        ],
++    )
++    con.commit()
++    con.close()
++    monkeypatch.setattr(mod, "_DB", db)
++    setattr(mod, "calls", calls)
++    yield mod
++    for card in list(mod._ACTIVE.values()):
++        if card._timer:
++            card._timer.cancel()
++    mod._ACTIVE.clear()
++    mod._ALIASES.clear()
++
++
++def _calls(ck):
++    return getattr(ck, "calls")
++
++
++def test_scope_priority(ck):
++    assert ck._scope("chatA") == "chatA"
++    assert ck._scope("chatA", thread_id="omt_1") == "chatA|omt_1"
++    assert ck._scope("chatA", thread_id="omt_1", session_key="raw_key") == "raw_key"
++
++
++def test_title_aligned_to_session_key_not_latest_chat(ck):
++    """同一 chat 下最近的 session 是『会话乙』，但 sess1 的卡片必须拿『会话甲』。"""
++    assert ck.session_title("chatA", session_key=SKEY_A) == "会话甲的标题"
++    assert ck.session_title("chatA", session_key=SKEY_B) == "会话乙的标题"
++    assert ck.session_title("chatA", thread_id="omt_1") == "会话甲的标题"
++    # 只有 chat_id 时才退回「最近一条」（兼容旧钩子）
++    assert ck.session_title("chatA") == "会话乙的标题"
++
++
++def test_concurrent_sessions_do_not_finalize_each_other(ck):
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A,
++                  title_hint="检查 hermes 更新")
++    b = ck.ensure("chatA", reply_to="root2", session_key=SKEY_B,
++                  title_hint="另一个任务")
++    assert a is not None and b is not None
++    assert a is not b and a.open_ok and b.open_ok
++    assert not a.finalized, "后一轮 ensure 把前一轮的卡 finalize 掉了（原单槽 bug）"
++    # 标题来自本轮消息摘要，不查 state.db（自动标题有落库竞态）
++    assert a.title == "检查 hermes 更新" and b.title == "另一个任务"
++
++    # 工具行按 scope 精确落到 b，不串到 a
++    assert ck.on_tool("chatA", "terminal", session_key=SKEY_B) is True
++    assert b._tool_lines == ["terminal"]
++    assert a._tool_lines == []
++
++    # 只封 a，b 仍活着
++    ck.on_send("chatA", "答案A", session_key=SKEY_A, is_final=True)
++    a.finalize()
++    assert a.finalized and not b.finalized
++    assert ck.get_active("chatA", session_key=SKEY_B) is b
++
++
++def test_thinking_delta_lands_in_panel(ck):
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A)
++    assert ck.on_thinking("chatA", "先", session_key=SKEY_A) is True
++    assert ck.on_thinking("chatA", "查一下", session_key=SKEY_A) is True
++    assert a._think == "先查一下"
++    a.finalize()
++    empty = [c for c in _calls(ck) if c[0] == "PUT"
++             and c[1].endswith("/think_text/content") and "无独立推理流" in str(c[2])]
++    assert not empty, "有真实推理流却写了空态"
++
++
++def test_finalize_writes_honest_empty_state(ck):
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A)
++    a.finalize()
++    empty = [c for c in _calls(ck) if c[0] == "PUT"
++             and c[1].endswith("/think_text/content") and "无独立推理流" in str(c[2])]
++    assert len(empty) == 1
++
++
++def test_edit_resolves_card_by_message_id(ck):
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A)
++    b = ck.ensure("chatA", reply_to="root2", session_key=SKEY_B)
++    # 模拟 streaming 的 edit_message：只知道 chat_id + message_id
++    assert ck.on_edit("chatA", "累积正文", message_id=b.message_id) is True
++    assert b._answer == "累积正文"
++    assert a._answer == ""
++    assert ck.on_edit("chatA", "最终正文", finalize=True, message_id=b.message_id) is True
++    b.finalize()
++    assert b.finalized and not a.finalized
++
++
++def test_tool_tee_runs_without_progress_queue(monkeypatch):
++    """飞书 tool_progress=false → needs_progress_queue=False → progress_queue=None。
++
++    回归：原实现把 CardKit 工具 tee 放在 `if not ctx.progress_queue: return` 之后，
++    导致 on_tool 从不执行、「工具调用」折叠框永远空。
++    """
++    import types
++    from gateway import run_turn_progress as rp
++    from gateway import cardkit_bridge as bridge
++
++    seen = []
++    monkeypatch.setattr(
++        bridge, "on_tool",
++        lambda chat, name, **kw: seen.append((chat, name, kw)) or True,
++    )
++    monkeypatch.setattr(rp, "local_viewer_turn", lambda _self: False)
++
++    inst = types.SimpleNamespace()
++    inst._ctx = types.SimpleNamespace(
++        source=types.SimpleNamespace(chat_id="chatA", thread_id="omt_a",
++                                     session_key="skeyA", platform=None),
++        session_key="skeyA",
++        progress_queue=None,          # 关键：飞书实际运行态
++        log_queue=None,
++        _run_still_current=lambda: True,
++        progress_mode="off",
++        last_tool=[None],
++        last_progress_msg=[None],
++        repeat_count=[0],
++        long_tool_hint_fired=[False],
++        tool_progress_enabled=False,
++        _thinking_enabled=False,
++        _native_slack_task_cards=False,
++        _cleanup_progress=False,
++        _cleanup_msg_ids=[],
++    )
++    inst._progress_live_status = lambda *a, **k: None
++    inst._progress_subagent_notice = lambda *a, **k: None
++    inst._progress_onboarding_hint = lambda *a, **k: None
++    inst._stream_consumer = lambda: None
++
++    rp.GatewayTurnProgressMixin.progress_callback(  # type: ignore[arg-type]
++        inst, "tool.started", "terminal", None, None
++    )
++    assert len(seen) == 1, "progress_queue=None 时工具 tee 没有执行"
++    assert seen[0][0] == "chatA" and seen[0][1] == "terminal"
++    assert seen[0][2]["thread_id"] == "omt_a"
++    assert seen[0][2]["session_key"] == "skeyA"
++
++
++def test_segment_finalize_does_not_seal_card(ck, monkeypatch):
++    """finalize=True 是段落封版（工具边界/拆块），不是回合结束。
++
++    回归：原实现见到 finalize 就封卡，第一次工具边界后卡片 finalized，
++    之后所有 thinking/tool/answer 全落到卡外独立消息。
++    """
++    sealed = []
++    monkeypatch.setattr(ck, "_seal_soon", lambda card, delay=1.5: sealed.append(card))
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A)
++
++    assert ck.on_edit("chatA", "段落一", finalize=True,
++                      is_turn_final=False, session_key=SKEY_A) is True
++    assert not sealed, "段落封版误触发封卡"
++    assert not a.finalized
++    # 封版之后工具调用仍要能进卡
++    assert ck.on_tool("chatA", "terminal", session_key=SKEY_A) is True
++    assert a._tool_lines == ["terminal"]
++
++    assert ck.on_edit("chatA", "最终答复", finalize=True,
++                      is_turn_final=True, session_key=SKEY_A) is True
++    assert len(sealed) == 1 and sealed[0] is a, "回合结束没有触发封卡"
++    assert a._answer == "最终答复"
++
++
++def test_send_writes_answer_not_thinking_panel(ck, monkeypatch):
++    """streaming ON 时 send() 的正文必须落进 main_answer。
++
++    回归：补修 3 把 send 文本全塞进 think_text，最终答复走 send 时正文
++    永远停在「（等待回答…）」（第四次反馈）。
++    """
++    sealed = []
++    monkeypatch.setattr(ck, "_seal_soon", lambda card, delay=1.5: sealed.append(card))
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A)
++    assert ck.on_edit("chatA", "累积正文", finalize=False, session_key=SKEY_A) is True
++    assert ck.on_send("chatA", "根因方向已经清楚了，再核一层", session_key=SKEY_A, is_final=True) is not None
++    # 补修 8：带 is_final 的答复会排一次短延迟封卡，但不立即置 finalized
++    assert len(sealed) == 1 and not a.finalized
++    assert a._answer == "根因方向已经清楚了，再核一层", "正文没写进 main_answer"
++    assert a._think == ""
++
++
++def test_heartbeat_writes_status_line_not_answer(ck):
++    """长任务心跳别把正文覆盖掉。"""
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A)
++    assert ck.on_edit("chatA", "累积正文", finalize=False, session_key=SKEY_A) is True
++    assert ck.on_edit("chatA", "⏳ Working — 6 min — iteration 4/150",
++                      finalize=False, session_key=SKEY_A) is True
++    assert a._answer == "累积正文"
++    a.finalize()
++    status = [c for c in _calls(ck) if c[0] == "PUT"
++              and c[1].endswith("/status_line/content")]
++    assert status
++
++
++def test_send_never_seals_card_when_streaming_on(ck, monkeypatch):
++    """streaming ON 时 send() 是首次发送/段间播报/心跳，绝不是最终答复。
++
++    回归：原实现在 _streamed=False 时见 send 就封卡，实机 181s 封卡、
++    turn 实跑 640s，之后所有内容溢出卡外（第二次反馈）。
++    """
++    sealed = []
++    monkeypatch.setattr(ck, "_seal_soon", lambda card, delay=1.5: sealed.append(card))
++    monkeypatch.setattr(ck, "_streaming_on", lambda: True)
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A)
++
++    # 非 final 的 send（首次发送/中间播报/心跳）一律不封卡、不写正文
++    assert ck.on_send("chatA", "我先把补丁整理一遍", session_key=SKEY_A, is_final=False) is not None
++    assert ck.on_send("chatA", "⏳ Working — 9 min", session_key=SKEY_A) is not None
++    assert not sealed and not a.finalized, "非最终答复误封卡"
++    assert a._answer == "", "中间播报不该写正文"
++
++    # 带 is_final 的答复：写正文 + 排一次短延迟封卡（不立即置 finalized）
++    assert ck.on_send("chatA", "我先把补丁整理一遍", session_key=SKEY_A, is_final=True) is not None
++    assert len(sealed) >= 1 and not a.finalized
++    assert a._answer == "我先把补丁整理一遍"
++
++    assert ck.on_send("chatA", "⏳ Working — 3 min — iteration 11/150",
++                      session_key=SKEY_A) is not None
++    assert len(sealed) >= 1 and not a.finalized, "心跳 send 额外封卡"
++    assert a._answer == "我先把补丁整理一遍", "心跳把正文覆盖了"
++    status = [c for c in _calls(ck) if c[0] == "PUT"
++              and c[1].endswith("/status_line/content")]
++    assert status, "心跳没写状态行"
++
++    # 卡片还活着：后续工具调用继续进折叠框
++    assert ck.on_tool("chatA", "terminal", session_key=SKEY_A) is True
++    assert a._tool_lines == ["terminal"]
++
++    # 只有真正回合结束的 edit 才封卡
++    assert ck.on_edit("chatA", "最终答复", finalize=True,
++                      is_turn_final=True, session_key=SKEY_A) is True
++    assert len(sealed) >= 1 and sealed[0] is a
++
++
++def test_streaming_off_keeps_legacy_send_semantics(ck, monkeypatch):
++    """display.streaming=false 时 send() 仍是最终答复：写正文并封卡。"""
++    sealed = []
++    monkeypatch.setattr(ck, "_seal_soon", lambda card, delay=1.5: sealed.append(card))
++    monkeypatch.setattr(ck, "_streaming_on", lambda: False)
++    a = ck.ensure("chatA", reply_to="root1", session_key=SKEY_A)
++    assert ck.on_send("chatA", "最终答复", session_key=SKEY_A, is_final=True) is not None
++    assert a._answer == "最终答复"
++    assert len(sealed) == 1
++
++
++# ── 系统性重构：ElementPolicy 策略测试（2026-11-07）──────────────────────
++
++
++def test_title_from_hint_strips_reply_prefix_and_truncates(ck):
++    assert ck._title_from_hint(
++        '[Replying to: "我在这里。"]  检查 hermes 最近更新状态'
++    ) == "检查 hermes 最近更新状态"
++    assert len(ck._title_from_hint("很长的标题" * 20)) == ck.ElementPolicy.TITLE_MAX
++    assert ck._title_from_hint(None) == "会话"
++    assert ck._title_from_hint("   ") == "会话"
++
++
++def test_title_no_longer_reads_state_db(ck):
++    """卡片标题不依赖 state.db：本轮消息摘要一定是本轮的，不会串台。"""
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A,
++                  title_hint="帮我查一下备份为什么没跑")
++    assert a.title == "帮我查一下备份为什么没跑"
++    assert "会话乙" not in a.title
++
++
++def test_thinking_only_keeps_recent_part(ck, monkeypatch):
++    monkeypatch.setattr(ck.ElementPolicy, "FLUSH_MIN_GAP", 0.0)
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    long_think = "前期推理段落甲乙丙丁" * 50 + "\n最新关键结论庚辛"
++    assert ck.on_thinking("chatA", long_think, session_key=SKEY_A) is True
++    text = a._render_element("think_text")
++    assert "▲ 早期思考已向上收起" in text
++    assert "最新关键结论庚辛" in text
++    # finalize 时恢复 100% 全量未截断文本
++    full_text = a._render_element("think_text", final=True)
++    assert full_text == long_think
++
++
++def test_consecutive_same_tools_all_counted(ck, monkeypatch):
++    """回归：原 push_tool 只比最后一条去重，8 次 terminal 只剩 2 次。"""
++    monkeypatch.setattr(ck.ElementPolicy, "FLUSH_MIN_GAP", 0.0)
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    for _ in range(8):
++        assert ck.on_tool("chatA", "terminal", session_key=SKEY_A, args={"command": "ls -l"}) is True
++    assert a.tool_count == 8 and len(a._tool_lines) == 8
++    text = a._render_element("tool_text")
++    assert "bash" in text
++    assert "ls -l" in text
++    assert "✅" in text
++    a.finalize()
++    status = [c for c in _calls(ck) if c[0] == "PUT"
++              and c[1].endswith("/status_line/content")]
++    assert any("8 次工具调用" in str(c[2]) for c in status)
++
++
++def test_tool_detail_keeps_last_12(ck, monkeypatch):
++    monkeypatch.setattr(ck.ElementPolicy, "FLUSH_MIN_GAP", 0.0)
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    for i in range(20):
++        ck.on_tool("chatA", f"tool_{i}", session_key=SKEY_A, args={"query": f"q_{i}"})
++    text = a._render_element("tool_text")
++    assert "已省略前 8 次" in text
++    assert "tool_8" in text and "tool_19" in text
++    assert "tool_0" not in text
++
++
++def test_render_diff_and_flush_throttle(ck):
++    """8 次工具事件不应产生 8 次全量 PUT；finalize 的 force 刷要补最终态。"""
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    for _ in range(8):
++        ck.on_tool("chatA", "terminal", session_key=SKEY_A)
++    puts = [c for c in _calls(ck) if c[0] == "PUT"
++            and c[1].endswith("/tool_text/content")]
++    assert len(puts) <= 2, f"节流失效，tool_text 被 PUT {len(puts)} 次"
++    a.render(force=True)
++    puts = [c for c in _calls(ck) if c[0] == "PUT"
++            and c[1].endswith("/tool_text/content")]
++    assert "🔧 8 次工具调用" in puts[-1][2]["content"]
++
++
++def test_finalize_renders_all_five_elements(ck):
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    assert ck.on_send("chatA", "最终答复", session_key=SKEY_A, is_final=True) is not None
++    a.finalize()
++    for eid in ("status_line", "main_answer", "think_text", "tool_text"):
++        puts = [c for c in _calls(ck) if c[0] == "PUT"
++                and c[1].endswith(f"/{eid}/content")]
++        assert puts, f"{eid} 没被统一渲染"
++    status = [c for c in _calls(ck) if c[0] == "PUT"
++              and c[1].endswith("/status_line/content")]
++    assert any("✅ 回合完成" in str(c[2]) for c in status)
++
++
++# ── 第五次反馈回归：中间播报不得覆盖正文（2026-11-07）────────────────────
++
++
++def test_interim_send_does_not_overwrite_answer(ck):
++    """35 分钟长任务里工具间的 16~45 字短句不能把结论冲刷掉。"""
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    assert ck.on_send("chatA", "最终结论：修复已生效", session_key=SKEY_A,
++                      is_final=True) is not None
++    assert a._answer == "最终结论：修复已生效"
++    for s in ("输出太长，我精确聚合一下", "继续拉飞书 API", "再核一次标题"):
++        assert ck.on_send("chatA", s, session_key=SKEY_A, is_final=False) is not None
++        assert a._answer == "最终结论：修复已生效", f"被中间播报覆盖：{s}"
++    assert a._status.startswith("⏳")
++
++
++def test_only_final_send_writes_main_answer(ck, monkeypatch):
++    monkeypatch.setattr(ck.ElementPolicy, "FLUSH_MIN_GAP", 0.0)
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    ck.on_send("chatA", "中间播报文本", session_key=SKEY_A, is_final=False)
++    puts = [c for c in _calls(ck) if c[0] == "PUT"
++            and c[1].endswith("/main_answer/content")]
++    assert all("中间播报文本" not in str(c[2]) for c in puts), "中间播报写进了正文"
++    assert a._answer == ""
++    ck.on_send("chatA", "真正的结论", session_key=SKEY_A, is_final=True)
++    puts = [c for c in _calls(ck) if c[0] == "PUT"
++            and c[1].endswith("/main_answer/content")]
++    assert any("真正的结论" in str(c[2]) for c in puts)
++
++
++# ── 第六次反馈回归：折叠面板降频 + 空正文兜底（2026-11-07）────────────────
++
++
++def test_panel_flush_is_slower_than_status(ck):
++    """思考/工具面板整段重绘，2s 节流；状态行/正文仍 0.2s 近实时。"""
++    assert ck.ElementPolicy.PANEL_FLUSH_GAP > ck.ElementPolicy.FLUSH_MIN_GAP
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    for i in range(10):
++        ck.on_thinking("chatA", f"片段{i}", session_key=SKEY_A)
++    tp = [c for c in _calls(ck) if c[0] == "PUT"
++          and c[1].endswith("/think_text/content")]
++    assert len(tp) <= 1, f"面板未降频，2 秒内 PUT 了 {len(tp)} 次"
++    a.render(force=True)  # finalize 的强制刷仍要写最终态
++    tp = [c for c in _calls(ck) if c[0] == "PUT"
++          and c[1].endswith("/think_text/content")]
++    assert "片段9" in tp[-1][2]["content"]
++
++
++def test_finalize_falls_back_to_last_interim(ck):
++    """gateway 某些路径不带 notify → 最终答复被误判 interim；封卡不能空正文。"""
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    assert ck.on_send("chatA", "这是本轮的最终结论，共若干字", session_key=SKEY_A,
++                      is_final=False) is not None
++    assert a._answer == ""
++    a.finalize()
++    assert a._answer == "这是本轮的最终结论，共若干字"
++    puts = [c for c in _calls(ck) if c[0] == "PUT"
++            and c[1].endswith("/main_answer/content")]
++    assert any("这是本轮的最终结论" in str(c[2]) for c in puts)
++
++
++# ── 第七次反馈回归：答复到即封卡 + redirect 提示不当结论（2026-11-07）────
++
++
++def test_final_answer_seals_promptly(ck, monkeypatch):
++    """答复一到就封卡，不再等 IDLE 兜底定时器（实测要 3~6 分钟）。"""
++    sealed = []
++    monkeypatch.setattr(ck, "_seal_soon",
++                        lambda card, delay=1.5: sealed.append((card, delay)))
++    monkeypatch.setattr(ck, "_streaming_on", lambda: True)
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    assert ck.on_send("chatA", "这是最终结论", session_key=SKEY_A,
++                      is_final=True) is not None
++    assert a._answer == "这是最终结论"
++    assert len(sealed) == 1 and sealed[0][0] is a
++
++
++def test_redirect_note_not_written_as_answer(ck):
++    """busy_input_mode=interrupt 的 ↪ 提示也带 notify，不能当最终答复封卡。"""
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    assert ck.on_send("chatA", "↪ Redirected current run", session_key=SKEY_A,
++                      is_final=True) is not None
++    assert a._answer == "", "系统提示被写进正文了"
++    assert a._status.startswith("⏳")
++
++
++# ── 600 秒流式窗口（2026-11-09 探针实测）──────────────────────────────
++# 飞书在 streaming_mode 打开 600s 后自动关闭（PUT 返回 200850 → 300309）。
++# 未关闭前 PATCH settings 重开无效；关闭之后重开有效（t=620s 重开 → 640s/900s PUT 成功）。
++# 策略：PUT 报关闭 → 重开 → 重发同一笔；重开失败才降级整卡 PATCH 消息。
++
++def _stream_api(calls, *, rearm_ok=True, put_codes=None):
++    """fake _api：PUT 依次返回 put_codes（用尽后 0），settings 重开按 rearm_ok。"""
++    seq = list(put_codes or [])
++
++    def fake_api(method, path, body=None, params=None):
++        calls.append((method, path, body))
++        if method == "PUT" and "/elements/" in path:
++            code = seq.pop(0) if seq else 0
++            return ({"code": code, "msg": "card streaming timeout"} if code
++                    else {"code": 0}), 200
++        if method == "PATCH" and path.endswith("/settings") and '"streaming_mode": true' in str(body):
++            return ({"code": 0} if rearm_ok else {"code": 300309, "msg": "closed"}), 200
++        return {"code": 0, "data": {"card_id": "card_x", "message_id": "msg_x"}}, 200
++    return fake_api
++
++
++def test_closed_window_is_rearmed_and_the_put_retried(ck):
++    """关闭后重开成功：同一笔正文重发进流式元素，不降级、不丢字。"""
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    a._seq = 0
++    calls = _calls(ck)
++    ck._api = _stream_api(calls, rearm_ok=True, put_codes=[200850])
++    a.push_answer("十分钟后的正文")
++    puts = [c for c in calls if c[0] == "PUT"]
++    rearm_i = next(i for i, c in enumerate(calls) if c[0] == "PATCH" and c[1].endswith("/settings")
++                   and '"streaming_mode": true' in str(c[2]))
++    rejected = calls[rearm_i - 1]
++    assert rejected[0] == "PUT", "重开前那一笔应是被 200850 拒掉的 PUT"
++    retried = calls[rearm_i + 1]
++    assert retried[0] == "PUT" and retried[1] == rejected[1], "重开后要重发被拒的同一元素"
++    assert retried[2]["content"] == rejected[2]["content"]
++    assert any("十分钟后的正文" in str(c[2]) for c in puts[1:]), "正文仍走流式元素写入"
++    assert sum(1 for c in calls if c[0] == "PATCH" and c[1].endswith("/settings")) == 1
++    assert a._stream_closed is False, "重开成功不该降级为整卡 PATCH"
++    seqs = [c[2]["sequence"] for c in calls if isinstance(c[2], dict) and "sequence" in c[2]]
++    assert seqs == sorted(seqs) and len(seqs) == len(set(seqs)), "sequence 必须严格递增"
++
++
++def test_failed_rearm_falls_back_to_full_card_patch(ck):
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    a._seq = 0
++    calls = _calls(ck)
++    ck._api = _stream_api(calls, rearm_ok=False, put_codes=[200850, 200850])
++    a.push_answer("第一段正文")
++    assert a._stream_closed is True
++    patches = [c for c in calls if c[0] == "PATCH" and c[1].startswith("/im/v1/messages/")]
++    assert patches, "重开失败后必须改写整卡消息"
++    assert "第一段正文" in str(patches[-1][2])
++
++
++def test_rearm_success_but_put_still_closed_falls_back(ck):
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    a._seq = 0
++    calls = _calls(ck)
++    ck._api = _stream_api(calls, rearm_ok=True, put_codes=[200850, 300309])
++    a.push_answer("仍然关着")
++    assert a._stream_closed is True
++    assert any(c[0] == "PATCH" and c[1].startswith("/im/v1/messages/") for c in calls)
++
++
++def test_rearm_attempts_are_capped(ck):
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    a._rearms = ck.MAX_STREAM_REARMS
++    assert a._rearm_streaming() is False
++
++
++def test_no_time_guard_before_feishu_reports_closure(ck, monkeypatch):
++    """不再按本地计时提前停 PUT：窗口是从「最后一次打开」算起，本地计时会误判。"""
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    a._seq = 0
++    monkeypatch.setattr(ck.time, "time", lambda: a.started + ck.STREAMING_WINDOW_SECS + 120)
++    calls = _calls(ck)
++    ck._api = _stream_api(calls)
++    a.push_answer("第 12 分钟的正文")
++    assert [c for c in calls if c[0] == "PUT" and "第 12 分钟的正文" in str(c[2])]
++    assert a._stream_closed is False
++
++
++def test_full_card_patch_carries_late_content_after_window(ck):
++    """降级模式下，第 10 分钟之后到达的正文仍要落屏（就是原来丢失的那段）。"""
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    a._seq = 0
++    a._stream_closed = True
++    calls = _calls(ck)
++    a._full_patch_at = 0.0
++    a.push_answer("十分钟之后才生成的结论")
++    a.push_tool("terminal")
++    a.finalize()
++    patches = [c for c in calls if c[0] == "PATCH" and c[1].startswith("/im/v1/messages/")]
++    assert patches
++    assert any("十分钟之后才生成的结论" in str(p[2]) for p in patches)
+diff --git a/tests/gateway/test_feishu_setup_cards.py b/tests/gateway/test_feishu_setup_cards.py
+new file mode 100644
+index 0000000000..cc97296175
+--- /dev/null
++++ b/tests/gateway/test_feishu_setup_cards.py
+@@ -0,0 +1,371 @@
++"""Feishu setup cards: dynamic catalog, channel scoping, form routing (豆花 2026-11-09).
++
++离线：目录、网关、飞书 API 全部用假对象，不发任何网络请求。
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from plugins.platforms.feishu import feishu_setup_cards as fc
++from plugins.platforms.feishu.adapter_choice_cards import FeishuChoiceCardsMixin
++
++
++# ── synthetic catalog (mirrors the shape list_picker_providers returns) ────
++CATALOG = [
++    {"slug": "antigravity-manager", "name": "Antigravity Manager", "is_current": True,
++     "models": ["gemini-3.8-flash-high", "claude-opus-4-6-thinking", "gpt-oss-120b"], "total_models": 3},
++    {"slug": "custom:openrouter", "name": "OpenRouter", "is_user_defined": True,
++     "models": ["zzz/dup-should-be-dropped"], "total_models": 1},
++    {"slug": "openrouter", "name": "OpenRouter",
++     "models": ["anthropic/claude-opus-5.5", "anthropic/claude-opus-4.8",
++                "anthropic/claude-sonnet-5.5", "openai/gpt-6-astra", "openai/gpt-6-astra:free",
++                "openai/gpt-6-astra:batch", "deepseek/deepseek-v4-pro",
++                "deepseek/deepseek-v4-pro-0813", "xiaomi/mimo-v2.6-pro", "~unbiased/pareto-latest"],
++     "total_models": 10},
++    {"slug": "nous", "name": "Nous Portal", "models": ["anthropic/claude-sonnet-5.5", "openai/gpt-5.5"],
++     "total_models": 2},
++    {"slug": "workbuddy", "name": "WorkBuddy Hub",
++     "models": ["hy4free", "glm-5.3", "kimi-k3.1-pro", "deepseek-v4.1-flash"], "total_models": 4},
++    {"slug": "dashscope", "name": "dashscope",
++     "models": ["qwen3.8-max", "deepseek-v4.1-flash-1017", "qwen-audio-3.0-tts-plus",
++                "qwen-audio-3.0-asr-flash"], "total_models": 4},
++    {"slug": "deepseek", "name": "DeepSeek", "models": ["deepseek-flash", "deepseek-v4-pro"],
++     "total_models": 2},
++    {"slug": "moa", "name": "MoA", "models": ["moa-panel"], "total_models": 1},
++    {"slug": "empty-provider", "name": "Empty", "models": [], "total_models": 0},
++]
++
++
++@pytest.fixture(autouse=True)
++def _clean_catalog(monkeypatch):
++    monkeypatch.setattr(fc, "_CATALOG", {"providers": None, "at": 0.0})
++    fc.remember_catalog(CATALOG)
++    yield
++    monkeypatch.setattr(fc, "_CATALOG", {"providers": None, "at": 0.0})
++
++
++# ── catalog normalisation ─────────────────────────────────────────────────
++def test_channels_come_from_catalog():
++    slugs = [c["slug"] for c in fc.normalize_channels()]
++    assert slugs == ["antigravity-manager", "openrouter", "nous", "workbuddy", "dashscope", "deepseek"]
++    # custom:openrouter 与原生重复 → 丢掉；moa / 空渠道 → 不出现
++    assert "custom:openrouter" not in slugs and "moa" not in slugs and "empty-provider" not in slugs
++
++
++def test_non_chat_endpoints_filtered():
++    dash = fc.find_channel("dashscope", fc.normalize_channels())
++    assert dash["models"] == ["qwen3.8-max", "deepseek-v4.1-flash-1017"]
++
++
++def test_aggregator_flagship_filter_is_family_based():
++    models = fc.find_channel("openrouter", fc.normalize_channels())["models"]
++    assert "anthropic/claude-opus-5.5" in models
++    assert "anthropic/claude-opus-4.8" not in models      # 同族旧版本
++    assert "deepseek/deepseek-v4-pro" in models
++    assert "deepseek/deepseek-v4-pro-0813" not in models  # 日期快照
++    assert not any(":free" in m or ":batch" in m or m.startswith("~") for m in models)
++    assert "xiaomi/mimo-v2.6-pro" in models               # 独有家族保留
++    assert len(models) <= fc.AGGREGATOR_MAX
++
++
++def test_direct_provider_keeps_every_model():
++    assert fc.find_channel("workbuddy", fc.normalize_channels())["models"] == [
++        "hy4free", "glm-5.3", "kimi-k3.1-pro", "deepseek-v4.1-flash"]
++
++
++# ── helpers ───────────────────────────────────────────────────────────────
++def test_reasoning_effort_value():
++    assert fc.reasoning_effort_value({"enabled": True, "effort": "high"}) == "high"
++    assert fc.reasoning_effort_value({"enabled": False}) == "none"
++    assert fc.reasoning_effort_value("xhigh") == "xhigh"
++    assert fc.reasoning_effort_value(None) is None
++
++
++def test_default_model_and_option_encoding():
++    chans = fc.normalize_channels()
++    assert fc.default_model_for("workbuddy", chans) == "hy4free"
++    assert fc.default_model_for("workbuddy", chans, "glm-5.3") == "glm-5.3"
++    assert fc.decode_option(fc.encode_option("workbuddy", "glm-5.3")) == ("workbuddy", "glm-5.3")
++    assert fc.decode_option("glm-5.3", "zai") == ("zai", "glm-5.3")
++    opts = fc.get_model_options("glm-5.3", fc.find_channel("workbuddy", chans))
++    assert all(o["value"].startswith("workbuddy::") for o in opts)
++    assert any(o["text"]["content"].startswith("✓") for o in opts)
++
++
++def test_unknown_channel_falls_back_to_catalog_current():
++    assert fc.pick_channel("does-not-exist", fc.normalize_channels())["slug"] == "antigravity-manager"
++
++
++# ── card structure ────────────────────────────────────────────────────────
++def _form(card):
++    return [e for e in card["body"]["elements"] if e["tag"] == "form"][0]["elements"]
++
++
++def test_new_topic_card_structure():
++    card = fc.build_new_topic_card(current_model="gemini-3.8-flash-high", current_reasoning="xhigh",
++                                   current_provider="antigravity-manager", chat_id="oc_x")
++    elems = _form(card)
++    assert [e["tag"] for e in elems] == ["input", "select_static", "select_static", "button"]
++    assert elems[0]["name"] == "topic_name"
++    assert all(v["value"].startswith("antigravity-manager::") for v in elems[1]["options"])
++    assert elems[2]["initial_option"] == "xhigh"
++    assert elems[3]["value"]["hermes_feishu_form_action"] == "new_topic"
++    assert elems[3]["value"]["chat_id"] == "oc_x"
++
++
++def test_switch_card_shows_live_state_and_channel_tabs():
++    card = fc.build_model_switch_card(current_model="hy4free", current_reasoning={"enabled": False},
++                                      current_provider="workbuddy", session_key="sk1")
++    intro = card["body"]["elements"][0]["content"]
++    assert "hy4free" in intro and "WorkBuddy" in intro and "none" in intro
++    tabs = card["body"]["elements"][1]["columns"][0]["elements"]
++    assert tabs[0]["value"]["hermes_feishu_form_action"] == "select_channel"
++    reasoning = [e for e in _form(card) if e["name"] == "reasoning_select"][0]
++    assert reasoning["initial_option"] == "none"   # 原实现会漏成空
++
++
++def test_viewing_other_channel_does_not_claim_current_model():
++    card = fc.build_model_switch_card(current_model="hy4free", current_provider="workbuddy",
++                                      session_key="sk1", view_provider="deepseek")
++    opts = [e for e in _form(card) if e["name"] == "model_select"][0]["options"]
++    assert opts[0]["value"].startswith("deepseek::")
++    # ✓ 只标在该渠道将要提交的那一项上，绝不把别的渠道的 hy4free 带过来标成当前
++    checked = [o["value"] for o in opts if "✓" in o["text"]["content"]]
++    assert checked == ["deepseek::deepseek-flash"]
++
++
++def test_card_stays_within_feishu_limits():
++    def count(node):
++        if isinstance(node, dict):
++            return (1 if "tag" in node else 0) + sum(count(v) for v in node.values())
++        if isinstance(node, list):
++            return sum(count(v) for v in node)
++        return 0
++
++    for slug in [c["slug"] for c in fc.normalize_channels()]:
++        card = fc.build_model_switch_card("x", "high", slug, "sk", None)
++        raw = json.dumps(card, ensure_ascii=False)
++        assert count(card) < 200, slug
++        assert len(raw.encode()) < 30000, slug
++
++
++# ── form routing ──────────────────────────────────────────────────────────
++class _FakeAsyncStore:
++    def __init__(self):
++        self.written = {}
++
++    async def set_model_override(self, skey, override):
++        self.written[skey] = override
++
++
++class _Conv:
++    model_override = None
++    reasoning_override = None
++
++
++class _State:
++    conversation = _Conv()
++
++
++class _FakeGw:
++    def __init__(self):
++        self.overrides = {}
++        self.reasoning = {}
++        self.evicted = []
++        self.async_session_store = _FakeAsyncStore()
++        self.session_store = SimpleNamespace(get_or_create_session=lambda src: None)
++
++    def _session_state(self, skey):
++        return _State()
++
++    def _session_model_override(self, skey):
++        return self.overrides.get(skey)
++
++    def _rehydrate_session_model_override(self, skey):
++        persisted = self.async_session_store.written.get(skey) or {}
++        if persisted:
++            self.overrides[skey] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
++
++    def _evict_cached_agent(self, skey):
++        self.evicted.append(skey)
++
++    def _resolve_session_reasoning_config(self, source=None, session_key=None, model=""):
++        return self.reasoning.get(session_key or "")
++
++    def _apply_reasoning_selection(self, skey, platform_key, value, persist_global=False):
++        from hermes_constants import parse_reasoning_effort
++        parsed = parse_reasoning_effort(value)
++        self.reasoning[skey] = None if value == "reset" else parsed
++        self.evicted.append(skey)
++        return f"思考等级已设为 {value}"
++
++    def _session_key_for_source(self, source):
++        return f"agent:main:feishu:dm:{source.chat_id}:{source.thread_id}"
++
++
++class _Host(FeishuChoiceCardsMixin):
++    def __init__(self, gw=None):
++        self.submitted = []
++        self.card = None
++        self.patched = []
++        self._last_model_picker_skey = ""
++        self._picker_form_state = {}
++        self.gw = gw or _FakeGw()
++
++    def _picker_gw(self):
++        return self.gw
++
++    def _submit_on_loop(self, loop, coro):
++        self.submitted.append(coro)
++
++    def _card_response(self, card_data=None):
++        self.card = card_data
++        return card_data
++
++    def _patch_card_message(self, message_id, card, *, delay=0.0):
++        self.patched.append((message_id, card))
++
++    async def get_chat_info(self, chat_id):
++        return {"name": "chat", "type": "dm"}
++
++    def build_source(self, **kw):
++        return SimpleNamespace(**kw)
++
++    def _session_key_for_source(self, source):
++        return f"agent:main:feishu:dm:{source.chat_id}:{source.thread_id}"
++
++
++def _event(*, value=None, form_value=None, name="", chat_id="oc_test", message_id="om_card"):
++    action = SimpleNamespace(value=value, form_value=form_value, name=name)
++    return SimpleNamespace(action=action,
++                           context=SimpleNamespace(open_chat_id=chat_id, open_message_id=message_id))
++
++
++def _run(coro):
++    return asyncio.new_event_loop().run_until_complete(coro)
++
++
++def test_select_channel_rerenders_scoped_models():
++    host = _Host()
++    ev = _event(value={"hermes_feishu_form_action": "select_channel", "provider": "dashscope",
++                       "card_type": "new_topic", "chat_id": "oc_test"},
++                form_value={}, name="btn_chan_dashscope")
++    card = host._handle_feishu_form_card_action(event=ev, action_value=ev.action.value, loop=None)
++    opts = [e for e in _form(card) if e["name"] == "model_select"][0]["options"]
++    assert [o["value"] for o in opts] == ["dashscope::qwen3.8-max", "dashscope::deepseek-v4.1-flash-1017"]
++    assert host.card is card
++
++
++def test_submit_new_topic_with_action_value_payload():
++    host = _Host()
++    ev = _event(value={"hermes_feishu_form_action": "new_topic", "chat_id": "oc_a", "provider": "workbuddy"},
++                form_value={"topic_name": "量化计算",
++                            "model_select": "workbuddy::glm-5.3", "reasoning_select": "high"})
++    card = host._handle_feishu_form_card_action(event=ev, action_value=ev.action.value, loop=None)
++    assert len(host.submitted) == 1
++    assert "量化计算" in card["header"]["title"]["content"]
++    assert "glm-5.3" in card["body"]["elements"][0]["content"]
++
++
++def test_submit_new_topic_when_action_value_is_empty():
++    host = _Host()
++    ev = _event(value=None, form_value={"topic_name": "数据分析",
++                                        "model_select": "dashscope::qwen3.8-max",
++                                        "reasoning_select": "xhigh"}, name="submit_new_topic")
++    card = host._handle_feishu_form_card_action(event=ev, action_value={}, loop=None)
++    assert len(host.submitted) == 1
++    assert "qwen3.8-max" in card["body"]["elements"][0]["content"]
++
++
++def test_submit_empty_form_falls_back_to_button_name_and_channel_default():
++    host = _Host()
++    host._remember_form_state("om_card", chat_id="oc_b", view_provider="workbuddy",
++                              model={"model": None, "provider": "workbuddy"})
++    ev = _event(value=None, form_value={}, name="submit_new_topic", chat_id="oc_b")
++    card = host._handle_feishu_form_card_action(event=ev, action_value={}, loop=None, form_value={})
++    assert len(host.submitted) == 1
++    assert "hy4free" in card["body"]["elements"][0]["content"]   # 渠道首个模型
++
++
++def test_submit_without_catalog_is_rejected_honestly():
++    """目录为空（例如配置全失效）时不许猜一个模型硬建话题。"""
++    fc._CATALOG["providers"] = []
++    fc._CATALOG["at"] = 0.0
++    host = _Host()
++    ev = _event(value=None, form_value={"topic_name": "空选"}, name="submit_new_topic")
++    card = host._handle_feishu_form_card_action(event=ev, action_value={}, loop=None)
++    assert host.submitted == []
++    assert "未选择模型" in card["header"]["title"]["content"]
++
++
++def test_route_write_is_verified_and_reports_failures(monkeypatch):
++    from plugins.platforms.feishu import adapter_choice_cards as acc
++    monkeypatch.setattr(acc, "_probe_provider_credentials", lambda p, m: {"api_key": "fake"})
++    gw = _FakeGw()
++    host = _Host(gw)
++    ok, notes = _run(host._apply_route_to_session(
++        gw, "sk1", model="glm-5.3", provider="workbuddy", reasoning="high"))
++    assert ok, notes
++    assert gw.async_session_store.written["sk1"]["model"] == "glm-5.3"
++    assert gw.overrides["sk1"]["provider"] == "workbuddy"
++    assert gw.reasoning["sk1"] == {"enabled": True, "effort": "high"}
++    assert "sk1" in gw.evicted
++
++
++def test_route_write_flags_unverified_route(monkeypatch):
++    from plugins.platforms.feishu import adapter_choice_cards as acc
++    monkeypatch.setattr(acc, "_probe_provider_credentials", lambda p, m: {"api_key": "fake"})
++
++    class _DropGw(_FakeGw):
++        def _rehydrate_session_model_override(self, skey):
++            pass   # 模拟写入被静默丢弃
++
++    gw = _DropGw()
++    host = _Host(gw)
++    ok, notes = _run(host._apply_route_to_session(gw, "sk2", model="x", provider="workbuddy"))
++    assert ok is False
++    assert any("未回读" in n for n in notes)
++
++
++def test_model_switch_applies_and_patches_result(monkeypatch):
++    from plugins.platforms.feishu import cardkit
++    from plugins.platforms.feishu import adapter_choice_cards as acc
++    monkeypatch.setattr(cardkit, "_api", lambda *a, **k: ({"code": 0}, 200))
++    monkeypatch.setattr(acc, "_probe_provider_credentials", lambda p, m: {"api_key": "fake"})
++    gw = _FakeGw()
++    gw.overrides["sk3"] = {"model": "hy4free", "provider": "workbuddy"}
++    host = _Host(gw)
++    _run(host._apply_feishu_model_switch_from_form(
++        chat_id="oc", session_key="sk3", model="deepseek-v4-pro", reasoning="medium",
++        provider="workbuddy", form_message_id="om_card", form_state={}))
++    assert gw.async_session_store.written["sk3"]["model"] == "deepseek-v4-pro"
++    assert host.patched and host.patched[0][0] == "om_card"
++    assert "已生效" in host.patched[0][1]["header"]["title"]["content"]
++
++
++def test_topic_creation_binds_the_real_session_key(monkeypatch):
++    from plugins.platforms.feishu import cardkit
++    from plugins.platforms.feishu import adapter_choice_cards as acc
++    monkeypatch.setattr(acc, "_probe_provider_credentials", lambda p, m: {"api_key": "fake"})
++
++    def fake_api(method, path, body=None, params=None):
++        if path == "/im/v1/messages":
++            return {"code": 0, "data": {"message_id": "om_root"}}, 200
++        if path == "/im/v1/messages/om_root/reply":
++            return {"code": 0, "data": {"thread_id": "omt_new"}}, 200
++        return {"code": 0}, 200
++
++    monkeypatch.setattr(cardkit, "_api", fake_api)
++    gw = _FakeGw()
++    host = _Host(gw)
++    _run(host._create_feishu_topic_from_form(
++        chat_id="oc_z", topic_name="化学", model="qwen3.8-max", reasoning="high",
++        provider="dashscope", form_message_id="om_form", form_state={}))
++    skey = "agent:main:feishu:dm:oc_z:omt_new"
++    assert gw.async_session_store.written[skey]["model"] == "qwen3.8-max"
++    assert gw.overrides[skey]["provider"] == "dashscope"
++    assert "就绪" in host.patched[0][1]["header"]["title"]["content"]
+diff --git a/tests/gateway/test_feishu_thread_reply.py b/tests/gateway/test_feishu_thread_reply.py
+new file mode 100644
+index 0000000000..100683d56c
+--- /dev/null
++++ b/tests/gateway/test_feishu_thread_reply.py
+@@ -0,0 +1,170 @@
++"""Group topic-reply toggle (FEISHU_THREAD_REPLY) behavior contracts.
++
++The toggle upgrades a threadless group-chat quote reply to ``reply_in_thread=true``
++(Feishu spawns the topic on the first threaded reply); DMs, open-id sends and
++in-topic replies must be untouched. Lives apart from test_feishu.py per the
++file-size ratchet (scripts/check FILE_LINES).
++"""
++
++import asyncio
++import os
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++try:
++    import lark_oapi
++    _HAS_LARK_OAPI = True
++except ImportError:
++    _HAS_LARK_OAPI = False
++
++
++@unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
++class TestFeishuThreadReplyToggle(unittest.TestCase):
++    """FEISHU_THREAD_REPLY upgrades a group-chat quote reply into a topic reply.
++
++    Feishu spawns the topic on the first ``reply_in_thread=true`` reply to a
++    threadless group message; the toggle must not touch DMs, open-id sends,
++    or replies already inside a topic.
++    """
++
++    def _reply_capture_adapter(self, *, thread_reply: bool, chat_type: str = "group"):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig())
++        adapter._thread_reply = thread_reply
++        adapter._chat_info_cache = {"oc_chat": {"chat_id": "oc_chat", "name": "g", "type": chat_type}}
++        captured = {}
++
++        class _MessageAPI:
++            def reply(self, request):
++                captured["request"] = request
++                return SimpleNamespace(
++                    success=lambda: True, data=SimpleNamespace(message_id="om_reply"),
++                )
++
++            def create(self, request):  # pragma: no cover - must never be used here
++                captured["create"] = request
++                raise AssertionError("create must not be called when a reply anchor exists")
++
++        adapter._client = SimpleNamespace(
++            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI())),
++        )
++        return adapter, captured
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_group_reply_forced_into_thread_when_enabled(self):
++        adapter, captured = self._reply_capture_adapter(thread_reply=True)
++        result = asyncio.run(adapter.send("oc_chat", "answer", reply_to="om_parent", metadata=None))
++        self.assertTrue(result.success)
++        self.assertTrue(captured["request"].request_body.reply_in_thread)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_group_reply_stays_quote_when_disabled(self):
++        adapter, captured = self._reply_capture_adapter(thread_reply=False)
++        result = asyncio.run(adapter.send("oc_chat", "answer", reply_to="om_parent", metadata=None))
++        self.assertTrue(result.success)
++        self.assertFalse(captured["request"].request_body.reply_in_thread)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_disabled_toggle_never_looks_up_chat_info(self):
++        adapter, _ = self._reply_capture_adapter(thread_reply=False)
++
++        async def _boom(*_a, **_k):
++            raise AssertionError("get_chat_info must not be consulted while the toggle is off")
++
++        adapter.get_chat_info = _boom
++        asyncio.run(adapter.send("oc_chat", "answer", reply_to="om_parent"))
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_dm_chat_never_threaded(self):
++        adapter, captured = self._reply_capture_adapter(thread_reply=True, chat_type="dm")
++        asyncio.run(adapter.send("oc_chat", "answer", reply_to="om_parent"))
++        self.assertFalse(captured["request"].request_body.reply_in_thread)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_open_id_target_never_threaded(self):
++        adapter, captured = self._reply_capture_adapter(thread_reply=True)
++        asyncio.run(adapter.send("ou_user", "answer", reply_to="om_parent"))
++        self.assertFalse(captured["request"].request_body.reply_in_thread)
++        # and the shortcut must not have paid for a chat lookup
++        self.assertNotIn("ou_user", adapter._chat_info_cache)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_in_topic_behavior_unchanged_with_toggle_off(self):
++        adapter, captured = self._reply_capture_adapter(thread_reply=False)
++        asyncio.run(adapter.send(
++            "oc_chat", "answer", reply_to="om_parent", metadata={"thread_id": "omt-1"},
++        ))
++        self.assertTrue(captured["request"].request_body.reply_in_thread)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_forum_chat_threaded_like_group(self):
++        """A topic-enabled group resolves to chat_type=forum; the toggle must thread it."""
++        adapter, captured = self._reply_capture_adapter(thread_reply=True, chat_type="forum")
++        asyncio.run(adapter.send("oc_chat", "answer", reply_to="om_parent"))
++        self.assertTrue(captured["request"].request_body.reply_in_thread)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_cold_cache_chat_lookup_failure_degrades_to_quote(self):
++        """Chat-type unknown (API down) must fall back to the pre-PR quoted reply, not fail the send.
++
++        The fallback is not cached, so the next reply retries the lookup — a transient
++        outage can never leave the toggle permanently inert.
++        """
++        adapter, captured = self._reply_capture_adapter(thread_reply=True)
++        adapter._chat_info_cache = {}
++
++        class _FailingChatAPI:
++            def get(self, request):
++                raise RuntimeError("chat lookup unreachable")
++
++        adapter._client.im.v1.chat = _FailingChatAPI()
++        result = asyncio.run(adapter.send("oc_chat", "answer", reply_to="om_parent"))
++        self.assertTrue(result.success)
++        self.assertFalse(captured["request"].request_body.reply_in_thread)
++        # failure path must not poison the cache — the next send retries the lookup
++        self.assertNotIn("oc_chat", adapter._chat_info_cache)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_group_rejecting_threads_degrades_to_plain_quote(self):
++        """230071/230072 must retry once as a plain quoted reply — never drop the answer."""
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        adapter = FeishuAdapter(PlatformConfig())
++        adapter._thread_reply = True
++        adapter._chat_info_cache = {"oc_chat": {"chat_id": "oc_chat", "name": "g", "type": "group"}}
++        requests = []
++
++        class _MessageAPI:
++            def reply(self, request):
++                requests.append(request)
++                if request.request_body.reply_in_thread:
++                    return SimpleNamespace(
++                        success=lambda: False, code=230071, msg="group does not support reply in thread", data=None,
++                    )
++                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_reply"))
++
++        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI())))
++        result = asyncio.run(adapter.send("oc_chat", "answer", reply_to="om_parent"))
++        self.assertTrue(result.success)
++        self.assertEqual(len(requests), 2)
++        self.assertTrue(requests[0].request_body.reply_in_thread)
++        self.assertFalse(requests[1].request_body.reply_in_thread)
++
++    @patch.dict(os.environ, {}, clear=True)
++    def test_settings_load_from_extra(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        self.assertTrue(FeishuAdapter(PlatformConfig(extra={"thread_reply": True}))._thread_reply)
++        self.assertFalse(FeishuAdapter(PlatformConfig(extra={"thread_reply": False}))._thread_reply)
++
++    @patch.dict(os.environ, {"FEISHU_THREAD_REPLY": "true"}, clear=True)
++    def test_settings_load_from_env(self):
++        from gateway.config import PlatformConfig
++        from plugins.platforms.feishu.adapter import FeishuAdapter
++
++        self.assertTrue(FeishuAdapter(PlatformConfig())._thread_reply)
+diff --git a/tests/gateway/test_setup_feishu.py b/tests/gateway/test_setup_feishu.py
+index 9bcfd0821c..c54cf4b41f 100644
+--- a/tests/gateway/test_setup_feishu.py
++++ b/tests/gateway/test_setup_feishu.py
+@@ -29,9 +29,9 @@ def _run_setup_feishu(
+     """
+     existing_env = existing_env or {}
+     prompt_yes_no_responses = list(prompt_yes_no_responses or [True])
+-    # QR path: method(0), dm(0), group(0) — 3 choices (no connection mode)
+-    # Manual path: method(1), domain(0), connection(0), dm(0), group(0) — 5 choices
+-    prompt_choice_responses = list(prompt_choice_responses or [0, 0, 0])
++    # QR path: method(0), dm(0), group(0), thread(0) — 4 choices (no connection mode)
++    # Manual path: method(1), domain(0), connection(0), dm(0), group(0), thread(0) — 6 choices
++    prompt_choice_responses = list(prompt_choice_responses or [0, 0, 0, 0])
+     prompt_responses = list(prompt_responses or [""])
+ 
+     saved_env = {}
+@@ -90,7 +90,7 @@ class TestSetupFeishuConnectionMode:
+     def test_manual_path_websocket(self, _mock_probe):
+         env, _ = _run_setup_feishu(
+             qr_result=None,
+-            prompt_choice_responses=[1, 0, 0, 0, 0],  # method=manual, domain=feishu, connection=ws, dm=pairing, group=open
++            prompt_choice_responses=[1, 0, 0, 0, 0, 0],  # method=manual, domain, connection=ws, dm=pairing, group=open, thread=off
+             prompt_responses=["cli_manual", "secret_manual", ""],  # app_id, app_secret, home_channel
+         )
+         assert env["FEISHU_CONNECTION_MODE"] == "websocket"
+@@ -110,7 +110,7 @@ class TestSetupFeishuDmPolicy:
+                 "open_id": "ou_owner", "bot_name": None, "bot_open_id": None,
+             },
+             prompt_yes_no_responses=[True],
+-            prompt_choice_responses=[0, dm_choice_idx, 0],  # method=QR, dm=<choice>, group=open
++            prompt_choice_responses=[0, dm_choice_idx, 0, 0],  # method=QR, dm=<choice>, group=open, thread=off
+             prompt_responses=prompt_responses or [""],
+         )
+         return env
+@@ -136,12 +136,51 @@ class TestSetupFeishuGroupPolicy:
+                 "open_id": None, "bot_name": None, "bot_open_id": None,
+             },
+             prompt_yes_no_responses=[True],
+-            prompt_choice_responses=[0, 0, 0],  # method=QR, dm=pairing, group=open
++            prompt_choice_responses=[0, 0, 0, 0],  # method=QR, dm=pairing, group=open, thread=off
+             prompt_responses=[""],
+         )
+         assert env["FEISHU_GROUP_POLICY"] == "open"
+ 
+ 
++# ---------------------------------------------------------------------------
++# Thread (topic) replies
++# ---------------------------------------------------------------------------
++
++class TestSetupFeishuThreadReply:
++
++    def _qr_env(self, prompt_choice_responses, prompt_responses=None):
++        return _run_setup_feishu(
++            qr_result={
++                "app_id": "cli_test", "app_secret": "s", "domain": "feishu",
++                "open_id": None, "bot_name": None, "bot_open_id": None,
++            },
++            prompt_yes_no_responses=[True],
++            prompt_choice_responses=prompt_choice_responses,
++            prompt_responses=prompt_responses or [""],
++        )[0]
++
++    def test_thread_choice_saves_true(self):
++        env = self._qr_env([0, 0, 0, 1])  # group=open, thread=topic
++        assert env["FEISHU_THREAD_REPLY"] == "true"
++
++    def test_quote_choice_saves_false(self):
++        env = self._qr_env([0, 0, 0, 0])
++        assert env["FEISHU_THREAD_REPLY"] == "false"
++
++    def test_groups_disabled_skips_thread_question(self):
++        # method, dm, group=disabled — no 4th response exists; exhausting it would raise.
++        env = self._qr_env([0, 0, 1])
++        assert "FEISHU_THREAD_REPLY" not in env
++
++    @patch.dict(os.environ, _SYS_ENV, clear=True)
++    def test_saved_true_reaches_adapter_settings(self):
++        env = self._qr_env([0, 0, 0, 1])
++        with patch.dict(os.environ, {**_SYS_ENV, **env}, clear=True):
++            from gateway.config import PlatformConfig
++            from plugins.platforms.feishu.adapter import FeishuAdapter
++            assert FeishuAdapter(PlatformConfig())._thread_reply is True
++
++
+ # ---------------------------------------------------------------------------
+ # Home channel (optional clear — Issue #12423)
+ # ---------------------------------------------------------------------------
+@@ -156,7 +195,7 @@ class TestSetupFeishuHomeChannel:
+                 "open_id": None, "bot_name": None, "bot_open_id": None,
+             },
+             prompt_yes_no_responses=[True],
+-            prompt_choice_responses=[0, 0, 0],
++            prompt_choice_responses=[0, 0, 0, 0],
+             prompt_responses=[""],
+             existing_env={"FEISHU_HOME_CHANNEL": "chat_old"},
+         )
+@@ -187,7 +226,7 @@ class TestSetupFeishuAdapterIntegration:
+                 "bot_open_id": "ou_bot_integration",
+             },
+             prompt_yes_no_responses=[True],
+-            prompt_choice_responses=[0, dm_idx, group_idx],  # method=QR, dm, group
++            prompt_choice_responses=[0, dm_idx, group_idx, 0],  # method=QR, dm, group, thread=off
+             prompt_responses=[""],
+         )
+         return env
+diff --git a/website/docs/user-guide/messaging/feishu.md b/website/docs/user-guide/messaging/feishu.md
+index 3e1996633e..b5ce68b71a 100644
+--- a/website/docs/user-guide/messaging/feishu.md
++++ b/website/docs/user-guide/messaging/feishu.md
+@@ -252,6 +252,31 @@ FEISHU_REQUIRE_MENTION=false
+ 
+ For per-chat control, set `require_mention` on a `group_rules` entry — see [Per-Group Access Control](#per-group-access-control) below.
+ 
++### Topic (Thread) Replies in Group Chats
++
++By default Hermes answers group messages as a quote-reply in the main chat flow. Set `FEISHU_THREAD_REPLY=true` to have replies land inside a Feishu topic instead: the bot's first answer quotes the triggering message with `reply_in_thread`, which spawns a fresh topic (话题) rooted on that message; every continuation chunk of the same answer joins that topic. The next question spawns its own topic, so group chatter stays tidy.
++
++```bash
++FEISHU_THREAD_REPLY=true
++```
++
++Or in `config.yaml` under the platform block:
++
++```yaml
++platforms:
++  feishu:
++    thread_reply: true
++```
++
++Notes:
++- Applies to **group chats only**. Direct messages, `ou_…` open-id sends, and replies already inside an existing topic behave exactly as before.
++- Scope is **message-triggered replies**. Cron jobs, notifications and home-channel deliveries carry no reply anchor, so they always post to the main chat — a Feishu topic can only be spawned by a reply, and a bare create into `thread_id` is not a valid API call (see #78975).
++- First reply per group after a gateway restart pays one extra `im.v1.chat.get` round-trip to determine the chat type; every later reply uses the warm cache. If that lookup fails (API outage), the reply degrades to a plain quoted reply and the next reply retries — the toggle can never be left permanently inert by a transient failure.
++- Topic replies require the group to accept them (话题群 always; a 对话群 depends on its group settings, and aggregated anchor messages can't be threaded). If Feishu rejects the topic form (errors 230071/230072), Hermes retries the same answer once as a plain quoted reply — the reply always lands, whatever the group mode.
++- Long answers are chunked; all chunks of one reply land in the same topic.
++- If the triggering message is withdrawn before the reply goes out, Hermes falls back to a normal top-level message (never a stray second topic).
++- `hermes setup feishu` asks for this preference during group-chat configuration.
++
+ ### Bot Identity
+ 
+ Hermes auto-detects the bot's `open_id` and display name on startup. You only need to set these manually when auto-detection cannot reach the Feishu API, or when your app uses tenant-scoped user IDs:
+@@ -563,6 +588,7 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
+ | `FEISHU_ALLOWED_USERS` | — | _(empty)_ | Comma-separated open_id list for user allowlist |
+ | `FEISHU_ALLOW_BOTS` | — | `none` | Accept messages from other bots: `none`, `mentions`, or `all` |
+ | `FEISHU_REQUIRE_MENTION` | — | `true` | Whether group messages must @mention the bot |
++| `FEISHU_THREAD_REPLY` | — | `false` | Answer group messages inside a topic thread (`reply_in_thread`) |
+ | `FEISHU_HOME_CHANNEL` | — | — | Chat ID for cron/notification output |
+ | `FEISHU_ENCRYPT_KEY` | — | _(empty)_ | Encrypt key for webhook signature verification |
+ | `FEISHU_VERIFICATION_TOKEN` | — | _(empty)_ | Verification token for webhook payload auth |
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
+index a2c91cd464..4721839352 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
+@@ -214,6 +214,31 @@ FEISHU_REQUIRE_MENTION=false
+ 
+ 如需按群控制，在 `group_rules` 条目中设置 `require_mention`——参见下方[按群访问控制](#per-group-access-control)。
+ 
++### 群聊话题（Thread）回复
++
++默认情况下，Hermes 在群聊中以引用回复的方式回答主聊天流中的消息。设置 `FEISHU_THREAD_REPLY=true` 后，回复将落在飞书话题内：机器人的首次回复会以 `reply_in_thread` 引用触发消息，从而基于该消息创建一个新话题；同一条回复的后续分块消息都会加入该话题。下一个问题会创建自己的新话题，群聊因此更加整洁。
++
++```bash
++FEISHU_THREAD_REPLY=true
++```
++
++或者在 `config.yaml` 的平台配置块中：
++
++```yaml
++platforms:
++  feishu:
++    thread_reply: true
++```
++
++说明：
++- 仅对**群聊**生效。私聊消息、向 `ou_…` open_id 发送的消息、以及已在现有话题内的回复均保持原有行为不变。
++- 作用范围是**消息触发的回复**。定时任务、通知和 home-channel 投递没有回复锚点，因此始终发到主聊天——飞书话题只能由回复创建，直接向 `thread_id` 裸发 create 并非合法 API（参见 #78975）。
++- 网关重启后每个群的首条回复会额外支付一次 `im.v1.chat.get` 查询以确定聊天类型；后续回复使用已就绪的缓存。若该查询失败（API 中断），本次回复降级为普通引用回复，下一条回复会自动重试查询——瞬时故障不会让开关永久失效。
++- 话题回复需要群聊本身支持（话题群天然支持；对话群取决于群设置，且被聚合的锚点消息不可再开话题）。若飞书拒绝话题形式（错误码 230071/230072），Hermes 会将同一条回复自动重试一次为普通引用回复——任何群模式下回复都能送达。
++- 长回复会分块发送；同一条回复的所有分块都会落在同一个话题中。
++- 如果触发消息在回复发出前被撤回，Hermes 将回退为普通顶层消息（不会产生多余的第二个话题）。
++- 在群聊配置步骤中，`hermes setup feishu` 会询问此偏好设置。
++
+ ### 机器人身份
+ 
+ Hermes 在启动时自动检测机器人的 `open_id` 和显示名称。仅当自动检测无法访问飞书 API，或你的应用使用租户范围用户 ID 时，才需要手动设置：
+@@ -498,6 +523,7 @@ platforms:
+ | `FEISHU_ALLOWED_USERS` | — | _（空）_ | 用户白名单的逗号分隔 open_id 列表 |
+ | `FEISHU_ALLOW_BOTS` | — | `none` | 接受其他机器人消息：`none`、`mentions` 或 `all` |
+ | `FEISHU_REQUIRE_MENTION` | — | `true` | 群消息是否必须 @提及 机器人 |
++| `FEISHU_THREAD_REPLY` | — | `false` | 群聊回复是否落入话题线程（`reply_in_thread`） |
+ | `FEISHU_HOME_CHANNEL` | — | — | cron/通知输出的聊天 ID |
+ | `FEISHU_ENCRYPT_KEY` | — | _（空）_ | webhook 签名验证的加密密钥 |
+ | `FEISHU_VERIFICATION_TOKEN` | — | _（空）_ | webhook payload 认证的验证 token |
