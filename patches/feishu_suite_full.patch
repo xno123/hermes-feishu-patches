@@ -1,8 +1,8 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index 241f094c31..66005725f2 100644
+index 52e11d4b77..db3a329069 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
-@@ -448,7 +448,8 @@ _CONTROL_STATE: dict[str, Any] = {
+@@ -430,7 +430,8 @@ _CONTROL_STATE: dict[str, Any] = {
      "_interrupt_thread_signal_pending": False,
      "_client_lock": threading.RLock,
      "_model_request_active": threading.Event,
@@ -146,7 +146,7 @@ index 0000000000..47cc14cf54
 +    except Exception:
 +        return False
 diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
-index 2391ba5941..7d1393e576 100644
+index 4bd5f80884..268b0e5b6a 100644
 --- a/gateway/run_inbound.py
 +++ b/gateway/run_inbound.py
 @@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
@@ -157,10 +157,10 @@ index 2391ba5941..7d1393e576 100644
  import json
  import os
  import re
-@@ -863,6 +864,26 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
-     async def _hm_cmd_new(self, event, source, _quick_key):
-         if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
-             return True, self._telegram_topic_root_new_message()
+@@ -965,6 +966,26 @@ class GatewayInboundMixin(
+         # first: the person's command still ends that turn's wait for background work at once.
+         from gateway.run_plugin_injection import person_input_joined_turn
+         person_input_joined_turn(self, _quick_key)
 +
 +        # 豆花本机补丁 2026-11-07：飞书平台裸 /new 弹出交互式新建话题表单卡片
 +        _plat = str(getattr(getattr(source, "platform", None), "value", getattr(source, "platform", "")) or "").lower()
@@ -185,10 +185,10 @@ index 2391ba5941..7d1393e576 100644
              event, "new", t("gateway.confirm.detail_new"),
              self._handle_reset_command,
 diff --git a/gateway/run_turn_progress.py b/gateway/run_turn_progress.py
-index c62873173d..c312a0e969 100644
+index cc5f40e3a0..a7a3f3be8f 100644
 --- a/gateway/run_turn_progress.py
 +++ b/gateway/run_turn_progress.py
-@@ -167,6 +167,21 @@ class GatewayTurnProgressMixin:
+@@ -219,6 +219,21 @@ class GatewayTurnProgressMixin:
              ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
              preview_str = f' "{preview}"' if preview else ""
              ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
@@ -211,10 +211,10 @@ index c62873173d..c312a0e969 100644
              return
          if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
 diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
-index 1b66830294..b55db4cbc8 100644
+index 1327228942..13cce6b74d 100644
 --- a/gateway/run_turn_runner.py
 +++ b/gateway/run_turn_runner.py
-@@ -482,6 +482,28 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+@@ -546,6 +546,28 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
          agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
              self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
          agent.reasoning_callback = None  # per turn: a reused agent never keeps an earlier API turn's sink
@@ -243,8 +243,8 @@ index 1b66830294..b55db4cbc8 100644
          if self._approval_owner is not None:
              from gateway.session_api_turn import api_execution, wire_api_observers
              if api_execution.get() is not None:
-@@ -1338,6 +1360,26 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
-                 runner._service_tier = tier
+@@ -1448,6 +1470,26 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
+         # The tier stays turn-local (turn_route): one runner serves concurrent turns of every profile.
          runner._reasoning_config = reasoning_config
          stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
 +        # 豆花本机补丁 2026-11-06：每轮开一张 CardKit 卡（门控 FEISHU_CARDKIT）。
@@ -267,11 +267,11 @@ index 1b66830294..b55db4cbc8 100644
 +                          reasoning_effort=_ck_effort or None)
 +        except Exception:
 +            pass
-         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs, tier=service_tier)
          agent, reused_cached_agent = self._resolve_turn_agent(
              turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
 diff --git a/gateway/stream_consumer_transport.py b/gateway/stream_consumer_transport.py
-index 3be6b06a52..71b1716f93 100644
+index 5fbc2560ae..0972dcf419 100644
 --- a/gateway/stream_consumer_transport.py
 +++ b/gateway/stream_consumer_transport.py
 @@ -28,7 +28,8 @@ class StreamTransportMixin:
@@ -301,7 +301,7 @@ index 3be6b06a52..71b1716f93 100644
          return await self.adapter.edit_message(**kwargs)
  
      async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
-@@ -495,7 +506,8 @@ class StreamTransportMixin:
+@@ -552,7 +563,8 @@ class StreamTransportMixin:
          ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
              return True
          result = await self._edit_message(message_id=self._message_id, content=text,
@@ -312,10 +312,10 @@ index 3be6b06a52..71b1716f93 100644
              return await self._on_edit_failure(result, text, finalize=finalize,
                                                 is_turn_final=is_turn_final)
 diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
-index 3d8d67a6ac..0bc6dfee46 100644
+index 06d7bb4724..b9fff67db5 100644
 --- a/plugins/platforms/feishu/adapter.py
 +++ b/plugins/platforms/feishu/adapter.py
-@@ -323,6 +323,7 @@ class FeishuAdapterSettings:
+@@ -325,6 +325,7 @@ class FeishuAdapterSettings:
      allow_bots: str = "none"  # "none" | "mentions" | "all"
      require_mention: bool = True
      allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
@@ -323,7 +323,7 @@ index 3d8d67a6ac..0bc6dfee46 100644
  
  
  @dataclass
-@@ -1326,6 +1327,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+@@ -1328,6 +1329,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
          self._card_action_tokens: dict[str, float] = {}  # token → first_seen_time
          # Inbound events that arrived before the loop was ready; one drainer thread replays them.
          self._pending_inbound_events: list[Any] = []
@@ -332,7 +332,7 @@ index 3d8d67a6ac..0bc6dfee46 100644
          self._pending_inbound_lock = threading.Lock()
          self._pending_drain_scheduled = False
          self._pending_inbound_max_depth = 1000  # cap queue; drop oldest beyond
-@@ -1420,6 +1423,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+@@ -1422,6 +1425,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
              default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
              group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
              require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
@@ -340,7 +340,7 @@ index 3d8d67a6ac..0bc6dfee46 100644
          )
  
      def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
-@@ -1660,6 +1664,20 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+@@ -1662,6 +1666,20 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
          if not self._client:
              return SendResult(success=False, error="Not connected")
  
@@ -361,9 +361,9 @@ index 3d8d67a6ac..0bc6dfee46 100644
          formatted = self.format_message(content)
          chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
          # Decide markdown-vs-text once for the whole message: a chunk of a long
-@@ -1705,11 +1723,21 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
-             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
-             return SendResult(success=False, error=str(exc))
+@@ -1706,11 +1724,21 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
+             logger.error("[Feishu] Send error: %s", (shown := describe_proxy_error(exc, env_proxy_for_redaction(_onboard_open_base_url(self._domain_name)))) or exc, exc_info=not shown)
+             return SendResult(success=False, error=shown or str(exc))
  
 -    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
 +    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
@@ -384,7 +384,7 @@ index 3d8d67a6ac..0bc6dfee46 100644
          content = self.format_message(content)
  
          async def _update(msg_type: str, payload: str) -> SendResult:
-@@ -2210,6 +2238,29 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+@@ -2214,6 +2242,29 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
          event = getattr(data, "event", None)
          action = getattr(event, "action", None)
          action_value = getattr(action, "value", {}) or {}
@@ -414,31 +414,69 @@ index 3d8d67a6ac..0bc6dfee46 100644
          for key, handler in self._CARD_ACTION_ROUTES if isinstance(action_value, dict) else ():
              if action_value.get(key):
                  return getattr(self, handler)(event=event, action_value=action_value, loop=loop)
-@@ -2510,10 +2561,12 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+@@ -2442,6 +2493,61 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
+         self._card_action_tokens[token] = now
+         return False
  
-     async def _dispatch_synthetic_event(
-         self, *, text: str, message_type: MessageType, chat_id: str, sender_id: Any, event_chat_type: str,
--        raw_message: Any, message_id: str,
++    async def _handle_card_action_event(self, data: Any) -> None:
++        """Route Feishu interactive card button clicks as synthetic COMMAND events."""
++        event = getattr(data, "event", None)
++        token = str(getattr(event, "token", "") or "")
++        if token and self._is_card_action_duplicate(token):
++            logger.debug("[Feishu] Dropping duplicate card action token: %s", token)
++            return
++        context = getattr(event, "context", None)
++        chat_id = str(getattr(context, "open_chat_id", "") or "")
++        operator = getattr(event, "operator", None)
++        open_id = str(getattr(operator, "open_id", "") or "")
++        if not chat_id or not open_id:
++            logger.debug("[Feishu] Card action missing chat_id or operator open_id, dropping")
++            return
++        action = getattr(event, "action", None)
++        action_tag = str(getattr(action, "tag", "") or "button")
++        action_value = getattr(action, "value", {}) or {}
++        synthetic_text = f"/card {action_tag}"
++        if action_value:
++            try:
++                synthetic_text += f" {json.dumps(action_value, ensure_ascii=False)}"
++            except Exception:
++                pass
++        logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
++        await self._dispatch_synthetic_event(
++            text=synthetic_text, message_type=MessageType.COMMAND, chat_id=chat_id,
++            sender_id=SimpleNamespace(open_id=open_id, user_id=None, union_id=None), event_chat_type="group",
++            raw_message=data, message_id=token or str(uuid.uuid4()),
++        )
++
++    async def _dispatch_synthetic_event(
++        self, *, text: str, message_type: MessageType, chat_id: str, sender_id: Any, event_chat_type: str,
 +        raw_message: Any, message_id: str, thread_id: Optional[str] = None,
-     ) -> None:
-         """Wrap a reaction/card click as a MessageEvent and run it through the guarded pipeline."""
--        sender_profile = await self._resolve_sender_profile(sender_id)
++    ) -> None:
++        """Wrap a reaction/card click as a MessageEvent and run it through the guarded pipeline."""
 +        sender_profile = (await self._resolve_sender_profile(sender_id)
 +                          if sender_id is not None
 +                          else {"user_id": "", "user_name": "User", "user_id_alt": None})
-         chat_info = await self.get_chat_info(chat_id)
-         source = self.build_source(
-             chat_id=chat_id,
-@@ -2521,7 +2574,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
-             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=event_chat_type),
-             user_id=sender_profile["user_id"],
-             user_name=sender_profile["user_name"],
--            thread_id=None,
++        chat_info = await self.get_chat_info(chat_id)
++        source = self.build_source(
++            chat_id=chat_id,
++            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
++            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=event_chat_type),
++            user_id=sender_profile["user_id"],
++            user_name=sender_profile["user_name"],
 +            thread_id=thread_id,
-             user_id_alt=sender_profile["user_id_alt"],
-         )
-         synthetic_event = MessageEvent(
-@@ -2677,6 +2730,12 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
++            user_id_alt=sender_profile["user_id_alt"],
++        )
++        synthetic_event = MessageEvent(
++            text=text, message_type=message_type, source=source, raw_message=raw_message,
++            message_id=message_id, channel_prompt=self._resolve_channel_prompt(chat_id),
++            timestamp=datetime.now(),
++        )
++        await self._handle_message_with_guards(synthetic_event)
++
+     # --- Per-chat serialization and typing indicator ---
+     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
+         """Per-chat asyncio.Lock for serial processing; LRU-bounded, never evicts a held lock if any is free."""
+@@ -2588,6 +2694,12 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
              or getattr(sender_id, "union_id", None) or "<unknown>"
          )
          chat_id = getattr(message, "chat_id", "") or ""
@@ -449,9 +487,9 @@ index 3d8d67a6ac..0bc6dfee46 100644
 +                self._last_inbound_message_id = {}
 +            self._last_inbound_message_id[(chat_id, thread_id or "")] = message_id
          logger.info(
-             "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s sender=%s:%s text=%r media=%d",
+             "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s sender=%s:%s text_len=%d media=%d",
              "dm" if chat_type == "p2p" else "group", message_id, inbound_type.value, chat_id,
-@@ -3731,7 +3790,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+@@ -3646,7 +3758,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
                  payload = json.dumps(key_payload, ensure_ascii=False)
                  thread_msg_id = (metadata or {}).get("reply_to_message_id")
                  if not thread_msg_id:
@@ -461,7 +499,7 @@ index 3d8d67a6ac..0bc6dfee46 100644
                  if thread_msg_id:
                      logger.info("[Feishu] Audio: retrying via reply API in thread")
                      message_response = await self._feishu_send_with_retry(
-@@ -3781,14 +3841,23 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
+@@ -3696,14 +3809,23 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
      async def _send_raw_message(
          self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
      ) -> Any:
@@ -490,7 +528,7 @@ index 3d8d67a6ac..0bc6dfee46 100644
          if thread_id:
              # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
              receive_id, receive_id_type = thread_id, "thread_id"
-@@ -4484,6 +4553,16 @@ def interactive_setup() -> None:
+@@ -4399,6 +4521,16 @@ def interactive_setup() -> None:
      save_env_value("FEISHU_GROUP_POLICY", "open" if group_idx == 0 else "disabled")
      print_info("Group chats enabled (bot must be @mentioned)." if group_idx == 0 else "Group chats disabled.")
  
@@ -508,28 +546,29 @@ index 3d8d67a6ac..0bc6dfee46 100644
      home_channel = prompt("Home chat ID (optional, for cron/notifications)", password=False).strip()
      if home_channel:
 diff --git a/plugins/platforms/feishu/adapter_choice_cards.py b/plugins/platforms/feishu/adapter_choice_cards.py
-index 06679e35ed..d9008321b4 100644
+index bf7fe58091..bbf530a188 100644
 --- a/plugins/platforms/feishu/adapter_choice_cards.py
 +++ b/plugins/platforms/feishu/adapter_choice_cards.py
-@@ -9,6 +9,7 @@ it answers anything.
+@@ -9,6 +9,8 @@ it answers anything.
  
  from __future__ import annotations
  
 +import asyncio
- import itertools
++import itertools
  import json
  import logging
-@@ -16,12 +17,22 @@ from typing import Any, Optional
- 
+ from typing import Any, Optional
+@@ -16,11 +18,22 @@ from typing import Any, Optional
  from agent.i18n import t
- from gateway.platforms.base import SendResult
+ from gateway.platforms.helpers import prompt_id_counter
+ from gateway.platforms.base import SendResult, describe_proxy_error, env_proxy_for_redaction
 +from plugins.platforms.feishu.feishu_setup_cards import cached_catalog, reasoning_effort_value
  
  logger = logging.getLogger(__name__)
  
  _BUTTON_LABEL_MAX = 40
  
- 
++
 +def _probe_provider_credentials(provider: str, model: str) -> dict:
 +    """Resolve a provider's runtime credentials the same way a turn would.
 +
@@ -542,7 +581,7 @@ index 06679e35ed..d9008321b4 100644
  class FeishuChoiceCardsMixin:
      """Clarify and choice-picker cards for ``FeishuAdapter`` (needs its card/state helpers)."""
  
-@@ -31,9 +42,11 @@ class FeishuChoiceCardsMixin:
+@@ -30,9 +43,11 @@ class FeishuChoiceCardsMixin:
          ("hermes_update_prompt_action", "_handle_update_prompt_card_action"),
          ("hermes_clarify_action", "_handle_clarify_card_action"),
          ("hermes_choice_picker_action", "_handle_choice_picker_card_action"),
@@ -554,7 +593,7 @@ index 06679e35ed..d9008321b4 100644
          # clarify_id -> {session_key, message_id, chat_id, question}
          self._clarify_state: dict[str, dict[str, str]] = {}
          # picker_id -> {session_key, message_id, chat_id, body, choices, on_choice_selected, metadata}
-@@ -234,3 +247,518 @@ class FeishuChoiceCardsMixin:
+@@ -246,3 +261,518 @@ class FeishuChoiceCardsMixin:
              result_text = t("platform.feishu.picker.apply_error", error=str(exc))
          if result_text:
              await self.send(state["chat_id"], str(result_text), metadata=state.get("metadata"))
@@ -1075,10 +1114,10 @@ index 06679e35ed..d9008321b4 100644
 +                "view_provider": provider, "session_key": session_key})
 diff --git a/plugins/platforms/feishu/cardkit.py b/plugins/platforms/feishu/cardkit.py
 new file mode 100644
-index 0000000000..ed92c6fa93
+index 0000000000..32786e0c57
 --- /dev/null
 +++ b/plugins/platforms/feishu/cardkit.py
-@@ -0,0 +1,1133 @@
+@@ -0,0 +1,1197 @@
 +"""Feishu CardKit 2.0 streaming transport (豆花本机扩展, 2026-11-06).
 +
 +Turns ONE Feishu assistant turn into ONE live 2.0 card:
@@ -1538,6 +1577,9 @@ index 0000000000..ed92c6fa93
 +        self._full_patch_at = 0.0
 +        self._dirty = False
 +        self._lock = threading.RLock()
++        self._render_lock = threading.Lock()
++        self._render_pending = False
++        self._render_thread: Optional[threading.Thread] = None
 +        self._timer: Optional[threading.Timer] = None
 +        self._seal_timer: Optional[threading.Timer] = None
 +        self._heartbeat_timer: Optional[threading.Timer] = None
@@ -1607,11 +1649,10 @@ index 0000000000..ed92c6fa93
 +                        self._status = f"🔧 执行工具中… (已调用 {self.tool_count} 次) · ⏱️ {time_str}"
 +                    else:
 +                        self._status = f"⏳ 正在处理中… · ⏱️ {time_str}"
-+                    if self._stream_closed:
-+                        # 无元素 PUT 可用：心跳直接把最新状态推上整卡。
-+                        self._flush_full_card(force=True)
-+                    else:
-+                        self.render()
++                    # 心跳只改状态再排队渲染：写卡全部走单一渲染线程，
++                    # 心跳定时器线程绝不做网络调用（曾把 .hermes/.env 都读不动的
++                    # Too many open files 风暴就是这样来的）。
++                    self._schedule_render()
 +            self._touch()
 +            if not self.finalized:
 +                t = threading.Timer(30.0, _beat)
@@ -1659,7 +1700,14 @@ index 0000000000..ed92c6fa93
 +        if self._stream_closed:
 +            self._flush_full_card(force=force)
 +            return True
-+        obj = self._put_content(eid, text)
++        # 首选瞬时写入（2026-11-17 用户反馈「模型很快但卡片一点一点吐字」）：
++        # 流式 content PUT 的打字机动画按固定速率渲染增量，整段回答要打几十秒；
++        # batch_update 直达目标状态。失败（老卡片实体/权限差异）才回退流式 PUT。
++        obj = self._put_content_instant(eid, text)
++        if obj.get("code") != 0:
++            _log("instant_put_fallback", scope=self.scope, eid=eid,
++                 code=obj.get("code"), msg=obj.get("msg") or obj.get("exc"))
++            obj = self._put_content(eid, text)
 +        if obj.get("code") in STREAM_CLOSED_CODES:
 +            # 飞书 600 秒流式窗口到点（2026-11-09 实测）。关闭后重新打开有效 → 重开并重发这一笔；
 +            # 重开失败才降级为整卡 PATCH，保证长任务正文不丢。
@@ -1682,6 +1730,23 @@ index 0000000000..ed92c6fa93
 +    def _put_content(self, eid: str, text: str) -> dict:
 +        obj, _code = _api("PUT", f"/cardkit/v1/cards/{self.card_id}/elements/{eid}/content",
 +                          {"content": text, "sequence": self._next()})
++        return obj if isinstance(obj, dict) else {}
++
++    def _put_content_instant(self, eid: str, text: str) -> dict:
++        """一帧替换元素内容（batch_update / partial_update_element）。
++
++        流式 content PUT 会让飞书客户端用**固定速度的打字机动画**渲染增量
++        （print_step 2 @ 40ms ≈ 50 字/秒）：模型回答快、整段到达时，卡片要
++        "打"几十秒才追上早已完成的模型 —— 就是用户看到的「一点一点吐字」。
++        partial_update_element 是卡片实体变更，直接渲染成目标状态，无动画。
++        """
++        actions = [{
++            "action": "partial_update_element",
++            "params": {"element_id": eid, "partial_element": {"content": text}},
++        }]
++        obj, _code = _api("POST", f"/cardkit/v1/cards/{self.card_id}/batch_update",
++                          {"uuid": str(uuid.uuid4()), "sequence": self._next(),
++                           "actions": json.dumps(actions, ensure_ascii=False)})
 +        return obj if isinstance(obj, dict) else {}
 +
 +    def _rearm_streaming(self) -> bool:
@@ -1803,16 +1868,52 @@ index 0000000000..ed92c6fa93
 +                   else ElementPolicy.FLUSH_MIN_GAP)
 +            if not force and now - self._last_put.get(eid, 0.0) < gap:
 +                continue  # 节流：留给下一次 render / finalize 的 force 刷
++            # 按尝试时刻节流而不是成功时刻：飞书连续失败时（限流/断网/EMFILE），
++            # 原实现不记时间戳 → 每个模型 delta 都全量重试，曾把网关 FD 打爆。
++            self._last_put[eid] = now
 +            if self._content(eid, text):
 +                self._last_written[eid] = text
-+                self._last_put[eid] = now
 +
 +    def set_status(self, text: str) -> None:
 +        with self._lock:  # sequence counter and state must be mutated atomically
 +            self._status = text
-+            self.render()
++            self._schedule_render()
 +
 +    # -- streaming sinks -------------------------------------------------------
++    def _schedule_render(self) -> None:
++        """Coalesce card updates off the model's stream-reading thread.
++
++        A Feishu request is allowed to be slow or wedged; model callbacks only update
++        state and return. One writer per card drains the latest state, so a stalled
++        display request cannot backpressure WorkBuddy or delay later tool calls.
++        """
++        if self._render_pending and self._render_thread is not None and self._render_thread.is_alive():
++            return
++        self._render_pending = True
++        self._render_thread = threading.Thread(
++            target=self._render_worker, name=f"feishu-card-render-{self.card_id or 'new'}", daemon=True)
++        self._render_thread.start()
++
++    def _render_worker(self) -> None:
++        try:
++            while True:
++                with self._lock:
++                    if not self._render_pending:
++                        break
++                    self._render_pending = False
++                # 单一写者：渲染期间不持状态锁（模型回调随时更新状态），
++                # 但 _render_lock 保证同一时刻只有一个人在写卡——
++                # sequence 不会交错，finalize 的收尾渲染也不会和它并发。
++                with self._render_lock:
++                    self.render()
++        except Exception:
++            _log("render_worker_error", scope=self.scope, exc_info=True)
++        finally:
++            with self._lock:
++                self._render_thread = None
++                if self._render_pending and not self.finalized:
++                    self._schedule_render()
++
 +    def push_answer(self, text: str) -> bool:
 +        """累积全量正文；具体落卡由 render() 统一决定。"""
 +        with self._lock:
@@ -1823,7 +1924,7 @@ index 0000000000..ed92c6fa93
 +            m, s = divmod(secs, 60)
 +            time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
 +            self._status = f"✍️ 正在回答… · ⏱️ {time_str}"
-+            self.render()
++            self._schedule_render()
 +            self._touch()
 +            return True
 +
@@ -1838,7 +1939,7 @@ index 0000000000..ed92c6fa93
 +            m, s = divmod(secs, 60)
 +            time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
 +            self._status = f"🧠 思考中… (已推理 {self._think_total:,} 字) · ⏱️ {time_str}"
-+            self.render()
++            self._schedule_render()
 +            self._touch()
 +            return True
 +
@@ -1858,7 +1959,7 @@ index 0000000000..ed92c6fa93
 +                s = entry
 +                self._tool_lines.append(s)
 +                self.tool_count = len(self._tool_lines)
-+            self.render()
++            self._schedule_render()
 +            self._touch()
 +            return True
 +
@@ -1938,11 +2039,13 @@ index 0000000000..ed92c6fa93
 +            bits.append(f"{self.tool_count} 次工具调用")
 +            self._status = "  ·  ".join(bits)
 +            # 唯一收尾出口：一次性渲染全部元素的最终态（含诚实空态），跳过节流。
-+            self.render(force=True)
-+            # 流式窗口已关时 render(force) 走的是整卡 PATCH；这里再强制刷一次，
-+            # 保证「✅ 回合完成」状态行与最终正文一定落屏（不受 6s 节流限制）。
-+            if self._stream_closed:
-+                self._flush_full_card(force=True)
++            # 与后台渲染线程互斥：force 渲染期间不允许元素写入并发穿插。
++            with self._render_lock:
++                self.render(force=True)
++                # 流式窗口已关时 render(force) 走的是整卡 PATCH；这里再强制刷一次，
++                # 保证「✅ 回合完成」状态行与最终正文一定落屏（不受 6s 节流限制）。
++                if self._stream_closed:
++                    self._flush_full_card(force=True)
 +            obj, code = _api("PATCH", f"/cardkit/v1/cards/{self.card_id}/settings",
 +                             {"settings": json.dumps({"config": {"streaming_mode": False}}),
 +                              "uuid": str(uuid.uuid4()), "sequence": self._next()})
@@ -2716,10 +2819,10 @@ index 0eabd947ea..75d9b3587b 100644
      prompt: "Home channel ID"
 diff --git a/tests/gateway/test_cardkit_scope.py b/tests/gateway/test_cardkit_scope.py
 new file mode 100644
-index 0000000000..1f1b1c5004
+index 0000000000..d7dda59d18
 --- /dev/null
 +++ b/tests/gateway/test_cardkit_scope.py
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,696 @@
 +"""CardKit 会话分槽 / 标题对齐 / 思考流 回归测试（豆花本机补丁 2026-11-07）。
 +
 +离线：mock 掉 _api 与 state.db，不发任何飞书消息。
@@ -2736,6 +2839,8 @@ index 0000000000..1f1b1c5004
 +from pathlib import Path
 +
 +import pytest
++
++from tests.waiting import wait_until
 +
 +ROOT = Path(__file__).resolve().parents[2]
 +CK_PATH = ROOT / "plugins" / "platforms" / "feishu" / "cardkit.py"
@@ -2769,6 +2874,10 @@ index 0000000000..1f1b1c5004
 +            return {"code": 0, "data": {"card_id": f"card_{len(calls)}"}}, 200
 +        if method == "POST" and path.startswith("/im/v1/messages"):
 +            return {"code": 0, "data": {"message_id": f"msg_{len(calls)}"}}, 200
++        # 本组用例验证传统流式 PUT 与关窗重试；显式拒绝瞬时 batch_update，
++        # 让生产代码进入其既有 PUT fallback，而不是把成功 POST 误判为“没有写入”。
++        if method == "POST" and path.endswith("/batch_update"):
++            return {"code": 400, "msg": "test: force streaming PUT fallback"}, 400
 +        return {"code": 0}, 200
 +
 +    monkeypatch.setattr(mod, "_api", fake_api)
@@ -3139,9 +3248,9 @@ index 0000000000..1f1b1c5004
 +    assert all("中间播报文本" not in str(c[2]) for c in puts), "中间播报写进了正文"
 +    assert a._answer == ""
 +    ck.on_send("chatA", "真正的结论", session_key=SKEY_A, is_final=True)
-+    puts = [c for c in _calls(ck) if c[0] == "PUT"
-+            and c[1].endswith("/main_answer/content")]
-+    assert any("真正的结论" in str(c[2]) for c in puts)
++    wait_until(lambda: any(c[0] == "PUT" and c[1].endswith("/main_answer/content")
++                           and "真正的结论" in str(c[2]) for c in _calls(ck)),
++               what="最终正文写入卡片")
 +
 +
 +# ── 第六次反馈回归：折叠面板降频 + 空正文兜底（2026-11-07）────────────────
@@ -3217,6 +3326,8 @@ index 0000000000..1f1b1c5004
 +                    else {"code": 0}), 200
 +        if method == "PATCH" and path.endswith("/settings") and '"streaming_mode": true' in str(body):
 +            return ({"code": 0} if rearm_ok else {"code": 300309, "msg": "closed"}), 200
++        if method == "POST" and path.endswith("/batch_update"):
++            return {"code": 400, "msg": "test: force streaming PUT fallback"}, 400
 +        return {"code": 0, "data": {"card_id": "card_x", "message_id": "msg_x"}}, 200
 +    return fake_api
 +
@@ -3228,6 +3339,9 @@ index 0000000000..1f1b1c5004
 +    calls = _calls(ck)
 +    ck._api = _stream_api(calls, rearm_ok=True, put_codes=[200850])
 +    a.push_answer("十分钟后的正文")
++    wait_until(lambda: any(c[0] == "PATCH" and c[1].endswith("/settings")
++                           and '"streaming_mode": true' in str(c[2]) for c in calls),
++               what="流式窗口重开")
 +    puts = [c for c in calls if c[0] == "PUT"]
 +    rearm_i = next(i for i, c in enumerate(calls) if c[0] == "PATCH" and c[1].endswith("/settings")
 +                   and '"streaming_mode": true' in str(c[2]))
@@ -3249,7 +3363,7 @@ index 0000000000..1f1b1c5004
 +    calls = _calls(ck)
 +    ck._api = _stream_api(calls, rearm_ok=False, put_codes=[200850, 200850])
 +    a.push_answer("第一段正文")
-+    assert a._stream_closed is True
++    wait_until(lambda: a._stream_closed, what="重开失败后降级整卡")
 +    patches = [c for c in calls if c[0] == "PATCH" and c[1].startswith("/im/v1/messages/")]
 +    assert patches, "重开失败后必须改写整卡消息"
 +    assert "第一段正文" in str(patches[-1][2])
@@ -3261,7 +3375,7 @@ index 0000000000..1f1b1c5004
 +    calls = _calls(ck)
 +    ck._api = _stream_api(calls, rearm_ok=True, put_codes=[200850, 300309])
 +    a.push_answer("仍然关着")
-+    assert a._stream_closed is True
++    wait_until(lambda: a._stream_closed, what="重开成功但 PUT 仍被拒后降级整卡")
 +    assert any(c[0] == "PATCH" and c[1].startswith("/im/v1/messages/") for c in calls)
 +
 +
@@ -3279,7 +3393,8 @@ index 0000000000..1f1b1c5004
 +    calls = _calls(ck)
 +    ck._api = _stream_api(calls)
 +    a.push_answer("第 12 分钟的正文")
-+    assert [c for c in calls if c[0] == "PUT" and "第 12 分钟的正文" in str(c[2])]
++    wait_until(lambda: [c for c in calls if c[0] == "PUT" and "第 12 分钟的正文" in str(c[2])],
++               what="晚到正文写入流式元素")
 +    assert a._stream_closed is False
 +
 +
@@ -3296,6 +3411,114 @@ index 0000000000..1f1b1c5004
 +    patches = [c for c in calls if c[0] == "PATCH" and c[1].startswith("/im/v1/messages/")]
 +    assert patches
 +    assert any("十分钟之后才生成的结论" in str(p[2]) for p in patches)
++
++
++def test_reasoning_callback_does_not_wait_for_a_hung_card_api(ck, monkeypatch):
++    """卡片接口卡住时，模型 reasoning 回调也必须立即返回，不能反向堵住流读取线程。"""
++    import threading
++
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    release_api = threading.Event()
++    callback_returned = threading.Event()
++
++    def hung_api(method, path, body=None, params=None):
++        release_api.wait(5)
++        return {"code": 0}, 200
++
++    monkeypatch.setattr(ck, "_api", hung_api)
++
++    def deliver_reasoning():
++        a.push_thinking("正在分析")
++        callback_returned.set()
++
++    worker = threading.Thread(target=deliver_reasoning, daemon=True)
++    worker.start()
++    try:
++        assert callback_returned.wait(2), "卡片网络写入阻塞了模型流回调"
++        assert a._think == "正在分析"
++    finally:
++        release_api.set()
++        worker.join(2)
++    assert not worker.is_alive()
++
++
++def test_failed_card_writes_are_throttled(ck, monkeypatch):
++    """飞书接口持续失败时，元素写入必须按节流间隔重试，不能逐 delta 全量重试。
++
++    回归：原实现只在写入成功后记 _last_put，失败重试不节流；模型高速输出 +
++    后台渲染线程曾以每秒上百次 PUT 打爆网关文件描述符（Too many open files）。
++    """
++    import threading
++
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    calls = _calls(ck)
++    monkeypatch.setattr(ck.ElementPolicy, "FLUSH_MIN_GAP", 1.0)
++    monkeypatch.setattr(ck.ElementPolicy, "PANEL_FLUSH_GAP", 2.0)
++
++    def failing_api(method, path, body=None, params=None):
++        calls.append((method, path, body))
++        if method in ("PUT", "POST") and ("/elements/" in path or path.endswith("/batch_update")):
++            return {"exc": "ECONNREFUSED"}, -1
++        return {"code": 0}, 200
++
++    monkeypatch.setattr(ck, "_api", failing_api)
++    stop_feeder = threading.Event()
++
++    def feed_deltas():
++        i = 0
++        while not stop_feeder.is_set():
++            a.push_thinking(f"第{i}段推理")
++            i += 1
++            stop_feeder.wait(0.02)  # 模拟 50Hz 的 reasoning delta
++
++    feeder = threading.Thread(target=feed_deltas, daemon=True)
++    feeder.start()
++    stop_feeder.wait(2.5)
++    stop_feeder.set()
++    feeder.join(2)
++
++    think_puts = [c for c in calls
++                  if (c[0] == "PUT" and "/think_text/content" in c[1])
++                  or (c[0] == "POST" and c[1].endswith("/batch_update") and "think_text" in str(c[2]))]
++    assert len(think_puts) <= 4, (
++        f"失败写入未被节流：2.5s 内 think_text 尝试了 {len(think_puts)} 次（节流间隔 2s 应 ≤2 次尝试）")
++    all_element_writes = [c for c in calls
++                          if (c[0] == "PUT" and "/content" in c[1]) or c[1].endswith("/batch_update")]
++    assert len(all_element_writes) <= 30, (
++        f"全卡写入风暴：2.5s 内共 {len(all_element_writes)} 次元素写入（无节流时为数百上千次）")
++
++
++def test_finalize_render_serializes_with_worker(ck, monkeypatch):
++    """finalize 的收尾渲染必须等后台渲染线程写完再写，元素写入不并发。"""
++    import threading
++
++    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
++    calls = _calls(ck)
++    write_started = threading.Event()
++    overlap = {"active": 0, "max": 0}
++    overlap_lock = threading.Lock()
++
++    def slow_api(method, path, body=None, params=None):
++        calls.append((method, path, body))
++        if method in ("PUT", "POST") and ("/elements/" in path or path.endswith("/batch_update")):
++            with overlap_lock:
++                overlap["active"] += 1
++                overlap["max"] = max(overlap["max"], overlap["active"])
++            write_started.set()
++            threading.Event().wait(0.05)  # 拉宽竞态窗口
++            with overlap_lock:
++                overlap["active"] -= 1
++            return {"code": 0}, 200
++        return {"code": 0, "data": {"card_id": "card_x", "message_id": "msg_x"}}, 200
++
++    monkeypatch.setattr(ck, "_api", slow_api)
++    a.push_thinking("慢速写入中的思考")
++    assert write_started.wait(2), "后台渲染线程未开始写入"
++    # worker 仍在 0.05s 的慢速 PUT 里时立刻收尾
++    a.finalize()
++    wait_until(lambda: a.finalized and not (a._render_thread and a._render_thread.is_alive()),
++               what="finalize 与渲染线程全部完成")
++    assert overlap["max"] == 1, f"元素写入出现并发（max={overlap['max']}），sequence 会交错被飞书拒收"
 diff --git a/tests/gateway/test_feishu_setup_cards.py b/tests/gateway/test_feishu_setup_cards.py
 new file mode 100644
 index 0000000000..cc97296175
@@ -3956,7 +4179,7 @@ index 9bcfd0821c..c54cf4b41f 100644
          )
          return env
 diff --git a/website/docs/user-guide/messaging/feishu.md b/website/docs/user-guide/messaging/feishu.md
-index 3e1996633e..b5ce68b71a 100644
+index ce46cf7abb..f5f2750743 100644
 --- a/website/docs/user-guide/messaging/feishu.md
 +++ b/website/docs/user-guide/messaging/feishu.md
 @@ -252,6 +252,31 @@ FEISHU_REQUIRE_MENTION=false
@@ -3991,7 +4214,7 @@ index 3e1996633e..b5ce68b71a 100644
  ### Bot Identity
  
  Hermes auto-detects the bot's `open_id` and display name on startup. You only need to set these manually when auto-detection cannot reach the Feishu API, or when your app uses tenant-scoped user IDs:
-@@ -563,6 +588,7 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
+@@ -565,6 +590,7 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
  | `FEISHU_ALLOWED_USERS` | — | _(empty)_ | Comma-separated open_id list for user allowlist |
  | `FEISHU_ALLOW_BOTS` | — | `none` | Accept messages from other bots: `none`, `mentions`, or `all` |
  | `FEISHU_REQUIRE_MENTION` | — | `true` | Whether group messages must @mention the bot |
@@ -4000,7 +4223,7 @@ index 3e1996633e..b5ce68b71a 100644
  | `FEISHU_ENCRYPT_KEY` | — | _(empty)_ | Encrypt key for webhook signature verification |
  | `FEISHU_VERIFICATION_TOKEN` | — | _(empty)_ | Verification token for webhook payload auth |
 diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
-index a2c91cd464..4721839352 100644
+index 53ca689460..31fbc695fa 100644
 --- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
 +++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/messaging/feishu.md
 @@ -214,6 +214,31 @@ FEISHU_REQUIRE_MENTION=false

@@ -5,7 +5,7 @@ Hermes Agent 飞书（Feishu / Lark）增强补丁套件：私聊与群聊话题
 A source-level patch suite for the Feishu (Lark) adapter of [Hermes Agent](https://github.com/NousResearch/hermes-agent): DM/group topics, CardKit 2.0 streaming cards (with automatic re-arm beyond Feishu's 600s streaming window), interactive `/new` and `/model` cards driven by Hermes' own dynamic model catalog, and polished thinking-stream / tool-call rendering. MIT licensed.
 
 > 这是**源码补丁**而非独立插件：Hermes 上游升级会覆盖 `gateway/` 与 `plugins/platforms/feishu/` 下的文件，本仓库提供一键重打补丁与体检看门狗。
-> 打补丁基线：Hermes v0.23.0（commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`）。其他版本请先用 `git apply --check` 验证。
+> 打补丁基线：Hermes v0.23.2（commit `ae2a81ccc0`）。其他版本请先用 `git apply --check` 验证。
 
 ## 快速开始
 
@@ -36,6 +36,7 @@ systemctl --user restart hermes-gateway.service       # 重启网关生效
 | **模型切换** | **`/model` 渠道与模型二级联动** | `feishu_setup_cards.py`<br>`adapter_choice_cards.py` | 顶部提供渠道 Tabs 按钮，点击即时原地刷新，模型下拉框仅展示当前渠道模型；对齐 8 档思考等级；自动精准回显当前生效值。模型目录直接读 Hermes 原生 `list_picker_providers()`，新增渠道/模型零改代码。 |
 | **思考流展示** | **平滑固定视窗（防抖归档）** | `cardkit.py` | 超过 360 字符平滑向上收起，顶部固定单行提示 `<font color='grey'>▲ 早期思考已向上收起 · 正在最新推理…</font>`，高度恒定锁定，绝无跳行；收尾时 100% 完整全量归档入折叠面板。 |
 | **工具调用** | **高密度专业开发者排版** | `cardkit.py`<br>`run_turn_progress.py`<br>`cardkit_bridge.py` | 像素级对齐 Open-WebUI/DSH 风格：`<font color='blue'>●</font>  ✅ **`bash`** — `command``；参数全链路抓取透传；保持 `str` 继承向后兼容；折叠栏动态显示 `🔧 工具调用（共 N 次）`。 |
+| **稳定性** | **卡片渲染与模型流解耦（防卡死）** | `cardkit.py` | `push_*` 回调只更新状态立即返回，写卡由后台单一渲染线程合并执行（`_schedule_render`）；失败写入按尝试时刻节流，杜绝每秒上百次重试打爆文件描述符；`_render_lock` 串行化 finalize 收尾渲染。飞书接口再慢也堵不住模型流，修复「waiting for stream response」长时间卡死与 fd 耗尽（2026-11-19，详见 `docs/`）。 |
 
 ---
 
@@ -50,8 +51,8 @@ systemctl --user restart hermes-gateway.service       # 重启网关生效
 
 1. **统一 Git Patch 文件**：
    - 路径：`~/.hermes/patches/feishu_suite_full.patch`
-   - 大小：约 204 KB
-   - 作用：一键将所有修改以标准 git diff 形式打入源码。
+   - 大小：约 211 KB
+   - 作用：一键将所有修改以标准 git diff 形式打入源码（基线 v0.23.2）。
 2. **完整镜像快照目录（Mirror Snapshot）**：
    - 路径：`~/.hermes/patches/feishu_suite_files/`
    - 包含文件：
@@ -86,7 +87,7 @@ bash ~/.hermes/scripts/apply_feishu_suite.sh
 **执行效果**：
 - 自动完成补丁打入或快照安全同步；
 - 自动校验 `.env` 环境变量；
-- 自动运行 pytest 单元测试并确保通过（最近基线：176 passed / 0 failed / 18 skipped，详见 `docs/`）。
+- 自动运行 pytest 单元测试并确保通过（最近基线：核心 4 测试文件 74 passed / 0 failed，2026-11-19 修复后实测，详见 `docs/`）。
 
 ### 步骤 2：重启网关加载生效
 
@@ -107,6 +108,7 @@ systemctl --user restart hermes-gateway.service
 - `2026-11-07_飞书补丁维护手册.md`：补丁基线、升级防错 SOP。
 - `2026-11-08_飞书卡片配置生效与思考流优化.md`：卡片配置生效链路与思考流优化。
 - `2026-11-09_飞书卡片600秒流式上限与动态模型目录.md`：飞书 600 秒流式窗口实测探针、重开/降级策略、模型目录动态化。
+- `2026-11-19_飞书卡片卡流修复与模型流解耦.md`：py-spy 实锤的卡片渲染反向堵死模型流根因分析、两轮修复（后台渲染线程/失败节流/_render_lock）与回归验证。
 
 ## License
 

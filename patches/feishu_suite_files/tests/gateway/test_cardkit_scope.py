@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.waiting import wait_until
+
 ROOT = Path(__file__).resolve().parents[2]
 CK_PATH = ROOT / "plugins" / "platforms" / "feishu" / "cardkit.py"
 
@@ -47,6 +49,10 @@ def ck(tmp_path, monkeypatch):
             return {"code": 0, "data": {"card_id": f"card_{len(calls)}"}}, 200
         if method == "POST" and path.startswith("/im/v1/messages"):
             return {"code": 0, "data": {"message_id": f"msg_{len(calls)}"}}, 200
+        # 本组用例验证传统流式 PUT 与关窗重试；显式拒绝瞬时 batch_update，
+        # 让生产代码进入其既有 PUT fallback，而不是把成功 POST 误判为“没有写入”。
+        if method == "POST" and path.endswith("/batch_update"):
+            return {"code": 400, "msg": "test: force streaming PUT fallback"}, 400
         return {"code": 0}, 200
 
     monkeypatch.setattr(mod, "_api", fake_api)
@@ -417,9 +423,9 @@ def test_only_final_send_writes_main_answer(ck, monkeypatch):
     assert all("中间播报文本" not in str(c[2]) for c in puts), "中间播报写进了正文"
     assert a._answer == ""
     ck.on_send("chatA", "真正的结论", session_key=SKEY_A, is_final=True)
-    puts = [c for c in _calls(ck) if c[0] == "PUT"
-            and c[1].endswith("/main_answer/content")]
-    assert any("真正的结论" in str(c[2]) for c in puts)
+    wait_until(lambda: any(c[0] == "PUT" and c[1].endswith("/main_answer/content")
+                           and "真正的结论" in str(c[2]) for c in _calls(ck)),
+               what="最终正文写入卡片")
 
 
 # ── 第六次反馈回归：折叠面板降频 + 空正文兜底（2026-11-07）────────────────
@@ -495,6 +501,8 @@ def _stream_api(calls, *, rearm_ok=True, put_codes=None):
                     else {"code": 0}), 200
         if method == "PATCH" and path.endswith("/settings") and '"streaming_mode": true' in str(body):
             return ({"code": 0} if rearm_ok else {"code": 300309, "msg": "closed"}), 200
+        if method == "POST" and path.endswith("/batch_update"):
+            return {"code": 400, "msg": "test: force streaming PUT fallback"}, 400
         return {"code": 0, "data": {"card_id": "card_x", "message_id": "msg_x"}}, 200
     return fake_api
 
@@ -506,6 +514,9 @@ def test_closed_window_is_rearmed_and_the_put_retried(ck):
     calls = _calls(ck)
     ck._api = _stream_api(calls, rearm_ok=True, put_codes=[200850])
     a.push_answer("十分钟后的正文")
+    wait_until(lambda: any(c[0] == "PATCH" and c[1].endswith("/settings")
+                           and '"streaming_mode": true' in str(c[2]) for c in calls),
+               what="流式窗口重开")
     puts = [c for c in calls if c[0] == "PUT"]
     rearm_i = next(i for i, c in enumerate(calls) if c[0] == "PATCH" and c[1].endswith("/settings")
                    and '"streaming_mode": true' in str(c[2]))
@@ -527,7 +538,7 @@ def test_failed_rearm_falls_back_to_full_card_patch(ck):
     calls = _calls(ck)
     ck._api = _stream_api(calls, rearm_ok=False, put_codes=[200850, 200850])
     a.push_answer("第一段正文")
-    assert a._stream_closed is True
+    wait_until(lambda: a._stream_closed, what="重开失败后降级整卡")
     patches = [c for c in calls if c[0] == "PATCH" and c[1].startswith("/im/v1/messages/")]
     assert patches, "重开失败后必须改写整卡消息"
     assert "第一段正文" in str(patches[-1][2])
@@ -539,7 +550,7 @@ def test_rearm_success_but_put_still_closed_falls_back(ck):
     calls = _calls(ck)
     ck._api = _stream_api(calls, rearm_ok=True, put_codes=[200850, 300309])
     a.push_answer("仍然关着")
-    assert a._stream_closed is True
+    wait_until(lambda: a._stream_closed, what="重开成功但 PUT 仍被拒后降级整卡")
     assert any(c[0] == "PATCH" and c[1].startswith("/im/v1/messages/") for c in calls)
 
 
@@ -557,7 +568,8 @@ def test_no_time_guard_before_feishu_reports_closure(ck, monkeypatch):
     calls = _calls(ck)
     ck._api = _stream_api(calls)
     a.push_answer("第 12 分钟的正文")
-    assert [c for c in calls if c[0] == "PUT" and "第 12 分钟的正文" in str(c[2])]
+    wait_until(lambda: [c for c in calls if c[0] == "PUT" and "第 12 分钟的正文" in str(c[2])],
+               what="晚到正文写入流式元素")
     assert a._stream_closed is False
 
 
@@ -574,3 +586,111 @@ def test_full_card_patch_carries_late_content_after_window(ck):
     patches = [c for c in calls if c[0] == "PATCH" and c[1].startswith("/im/v1/messages/")]
     assert patches
     assert any("十分钟之后才生成的结论" in str(p[2]) for p in patches)
+
+
+def test_reasoning_callback_does_not_wait_for_a_hung_card_api(ck, monkeypatch):
+    """卡片接口卡住时，模型 reasoning 回调也必须立即返回，不能反向堵住流读取线程。"""
+    import threading
+
+    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
+    release_api = threading.Event()
+    callback_returned = threading.Event()
+
+    def hung_api(method, path, body=None, params=None):
+        release_api.wait(5)
+        return {"code": 0}, 200
+
+    monkeypatch.setattr(ck, "_api", hung_api)
+
+    def deliver_reasoning():
+        a.push_thinking("正在分析")
+        callback_returned.set()
+
+    worker = threading.Thread(target=deliver_reasoning, daemon=True)
+    worker.start()
+    try:
+        assert callback_returned.wait(2), "卡片网络写入阻塞了模型流回调"
+        assert a._think == "正在分析"
+    finally:
+        release_api.set()
+        worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_failed_card_writes_are_throttled(ck, monkeypatch):
+    """飞书接口持续失败时，元素写入必须按节流间隔重试，不能逐 delta 全量重试。
+
+    回归：原实现只在写入成功后记 _last_put，失败重试不节流；模型高速输出 +
+    后台渲染线程曾以每秒上百次 PUT 打爆网关文件描述符（Too many open files）。
+    """
+    import threading
+
+    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
+    calls = _calls(ck)
+    monkeypatch.setattr(ck.ElementPolicy, "FLUSH_MIN_GAP", 1.0)
+    monkeypatch.setattr(ck.ElementPolicy, "PANEL_FLUSH_GAP", 2.0)
+
+    def failing_api(method, path, body=None, params=None):
+        calls.append((method, path, body))
+        if method in ("PUT", "POST") and ("/elements/" in path or path.endswith("/batch_update")):
+            return {"exc": "ECONNREFUSED"}, -1
+        return {"code": 0}, 200
+
+    monkeypatch.setattr(ck, "_api", failing_api)
+    stop_feeder = threading.Event()
+
+    def feed_deltas():
+        i = 0
+        while not stop_feeder.is_set():
+            a.push_thinking(f"第{i}段推理")
+            i += 1
+            stop_feeder.wait(0.02)  # 模拟 50Hz 的 reasoning delta
+
+    feeder = threading.Thread(target=feed_deltas, daemon=True)
+    feeder.start()
+    stop_feeder.wait(2.5)
+    stop_feeder.set()
+    feeder.join(2)
+
+    think_puts = [c for c in calls
+                  if (c[0] == "PUT" and "/think_text/content" in c[1])
+                  or (c[0] == "POST" and c[1].endswith("/batch_update") and "think_text" in str(c[2]))]
+    assert len(think_puts) <= 4, (
+        f"失败写入未被节流：2.5s 内 think_text 尝试了 {len(think_puts)} 次（节流间隔 2s 应 ≤2 次尝试）")
+    all_element_writes = [c for c in calls
+                          if (c[0] == "PUT" and "/content" in c[1]) or c[1].endswith("/batch_update")]
+    assert len(all_element_writes) <= 30, (
+        f"全卡写入风暴：2.5s 内共 {len(all_element_writes)} 次元素写入（无节流时为数百上千次）")
+
+
+def test_finalize_render_serializes_with_worker(ck, monkeypatch):
+    """finalize 的收尾渲染必须等后台渲染线程写完再写，元素写入不并发。"""
+    import threading
+
+    a = ck.ensure("chatA", reply_to="root", session_key=SKEY_A)
+    calls = _calls(ck)
+    write_started = threading.Event()
+    overlap = {"active": 0, "max": 0}
+    overlap_lock = threading.Lock()
+
+    def slow_api(method, path, body=None, params=None):
+        calls.append((method, path, body))
+        if method in ("PUT", "POST") and ("/elements/" in path or path.endswith("/batch_update")):
+            with overlap_lock:
+                overlap["active"] += 1
+                overlap["max"] = max(overlap["max"], overlap["active"])
+            write_started.set()
+            threading.Event().wait(0.05)  # 拉宽竞态窗口
+            with overlap_lock:
+                overlap["active"] -= 1
+            return {"code": 0}, 200
+        return {"code": 0, "data": {"card_id": "card_x", "message_id": "msg_x"}}, 200
+
+    monkeypatch.setattr(ck, "_api", slow_api)
+    a.push_thinking("慢速写入中的思考")
+    assert write_started.wait(2), "后台渲染线程未开始写入"
+    # worker 仍在 0.05s 的慢速 PUT 里时立刻收尾
+    a.finalize()
+    wait_until(lambda: a.finalized and not (a._render_thread and a._render_thread.is_alive()),
+               what="finalize 与渲染线程全部完成")
+    assert overlap["max"] == 1, f"元素写入出现并发（max={overlap['max']}），sequence 会交错被飞书拒收"

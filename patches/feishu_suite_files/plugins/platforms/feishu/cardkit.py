@@ -457,6 +457,9 @@ class CardKitStream:
         self._full_patch_at = 0.0
         self._dirty = False
         self._lock = threading.RLock()
+        self._render_lock = threading.Lock()
+        self._render_pending = False
+        self._render_thread: Optional[threading.Thread] = None
         self._timer: Optional[threading.Timer] = None
         self._seal_timer: Optional[threading.Timer] = None
         self._heartbeat_timer: Optional[threading.Timer] = None
@@ -526,11 +529,10 @@ class CardKitStream:
                         self._status = f"🔧 执行工具中… (已调用 {self.tool_count} 次) · ⏱️ {time_str}"
                     else:
                         self._status = f"⏳ 正在处理中… · ⏱️ {time_str}"
-                    if self._stream_closed:
-                        # 无元素 PUT 可用：心跳直接把最新状态推上整卡。
-                        self._flush_full_card(force=True)
-                    else:
-                        self.render()
+                    # 心跳只改状态再排队渲染：写卡全部走单一渲染线程，
+                    # 心跳定时器线程绝不做网络调用（曾把 .hermes/.env 都读不动的
+                    # Too many open files 风暴就是这样来的）。
+                    self._schedule_render()
             self._touch()
             if not self.finalized:
                 t = threading.Timer(30.0, _beat)
@@ -578,7 +580,14 @@ class CardKitStream:
         if self._stream_closed:
             self._flush_full_card(force=force)
             return True
-        obj = self._put_content(eid, text)
+        # 首选瞬时写入（2026-11-17 用户反馈「模型很快但卡片一点一点吐字」）：
+        # 流式 content PUT 的打字机动画按固定速率渲染增量，整段回答要打几十秒；
+        # batch_update 直达目标状态。失败（老卡片实体/权限差异）才回退流式 PUT。
+        obj = self._put_content_instant(eid, text)
+        if obj.get("code") != 0:
+            _log("instant_put_fallback", scope=self.scope, eid=eid,
+                 code=obj.get("code"), msg=obj.get("msg") or obj.get("exc"))
+            obj = self._put_content(eid, text)
         if obj.get("code") in STREAM_CLOSED_CODES:
             # 飞书 600 秒流式窗口到点（2026-11-09 实测）。关闭后重新打开有效 → 重开并重发这一笔；
             # 重开失败才降级为整卡 PATCH，保证长任务正文不丢。
@@ -601,6 +610,23 @@ class CardKitStream:
     def _put_content(self, eid: str, text: str) -> dict:
         obj, _code = _api("PUT", f"/cardkit/v1/cards/{self.card_id}/elements/{eid}/content",
                           {"content": text, "sequence": self._next()})
+        return obj if isinstance(obj, dict) else {}
+
+    def _put_content_instant(self, eid: str, text: str) -> dict:
+        """一帧替换元素内容（batch_update / partial_update_element）。
+
+        流式 content PUT 会让飞书客户端用**固定速度的打字机动画**渲染增量
+        （print_step 2 @ 40ms ≈ 50 字/秒）：模型回答快、整段到达时，卡片要
+        "打"几十秒才追上早已完成的模型 —— 就是用户看到的「一点一点吐字」。
+        partial_update_element 是卡片实体变更，直接渲染成目标状态，无动画。
+        """
+        actions = [{
+            "action": "partial_update_element",
+            "params": {"element_id": eid, "partial_element": {"content": text}},
+        }]
+        obj, _code = _api("POST", f"/cardkit/v1/cards/{self.card_id}/batch_update",
+                          {"uuid": str(uuid.uuid4()), "sequence": self._next(),
+                           "actions": json.dumps(actions, ensure_ascii=False)})
         return obj if isinstance(obj, dict) else {}
 
     def _rearm_streaming(self) -> bool:
@@ -722,16 +748,52 @@ class CardKitStream:
                    else ElementPolicy.FLUSH_MIN_GAP)
             if not force and now - self._last_put.get(eid, 0.0) < gap:
                 continue  # 节流：留给下一次 render / finalize 的 force 刷
+            # 按尝试时刻节流而不是成功时刻：飞书连续失败时（限流/断网/EMFILE），
+            # 原实现不记时间戳 → 每个模型 delta 都全量重试，曾把网关 FD 打爆。
+            self._last_put[eid] = now
             if self._content(eid, text):
                 self._last_written[eid] = text
-                self._last_put[eid] = now
 
     def set_status(self, text: str) -> None:
         with self._lock:  # sequence counter and state must be mutated atomically
             self._status = text
-            self.render()
+            self._schedule_render()
 
     # -- streaming sinks -------------------------------------------------------
+    def _schedule_render(self) -> None:
+        """Coalesce card updates off the model's stream-reading thread.
+
+        A Feishu request is allowed to be slow or wedged; model callbacks only update
+        state and return. One writer per card drains the latest state, so a stalled
+        display request cannot backpressure WorkBuddy or delay later tool calls.
+        """
+        if self._render_pending and self._render_thread is not None and self._render_thread.is_alive():
+            return
+        self._render_pending = True
+        self._render_thread = threading.Thread(
+            target=self._render_worker, name=f"feishu-card-render-{self.card_id or 'new'}", daemon=True)
+        self._render_thread.start()
+
+    def _render_worker(self) -> None:
+        try:
+            while True:
+                with self._lock:
+                    if not self._render_pending:
+                        break
+                    self._render_pending = False
+                # 单一写者：渲染期间不持状态锁（模型回调随时更新状态），
+                # 但 _render_lock 保证同一时刻只有一个人在写卡——
+                # sequence 不会交错，finalize 的收尾渲染也不会和它并发。
+                with self._render_lock:
+                    self.render()
+        except Exception:
+            _log("render_worker_error", scope=self.scope, exc_info=True)
+        finally:
+            with self._lock:
+                self._render_thread = None
+                if self._render_pending and not self.finalized:
+                    self._schedule_render()
+
     def push_answer(self, text: str) -> bool:
         """累积全量正文；具体落卡由 render() 统一决定。"""
         with self._lock:
@@ -742,7 +804,7 @@ class CardKitStream:
             m, s = divmod(secs, 60)
             time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
             self._status = f"✍️ 正在回答… · ⏱️ {time_str}"
-            self.render()
+            self._schedule_render()
             self._touch()
             return True
 
@@ -757,7 +819,7 @@ class CardKitStream:
             m, s = divmod(secs, 60)
             time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
             self._status = f"🧠 思考中… (已推理 {self._think_total:,} 字) · ⏱️ {time_str}"
-            self.render()
+            self._schedule_render()
             self._touch()
             return True
 
@@ -777,7 +839,7 @@ class CardKitStream:
                 s = entry
                 self._tool_lines.append(s)
                 self.tool_count = len(self._tool_lines)
-            self.render()
+            self._schedule_render()
             self._touch()
             return True
 
@@ -857,11 +919,13 @@ class CardKitStream:
             bits.append(f"{self.tool_count} 次工具调用")
             self._status = "  ·  ".join(bits)
             # 唯一收尾出口：一次性渲染全部元素的最终态（含诚实空态），跳过节流。
-            self.render(force=True)
-            # 流式窗口已关时 render(force) 走的是整卡 PATCH；这里再强制刷一次，
-            # 保证「✅ 回合完成」状态行与最终正文一定落屏（不受 6s 节流限制）。
-            if self._stream_closed:
-                self._flush_full_card(force=True)
+            # 与后台渲染线程互斥：force 渲染期间不允许元素写入并发穿插。
+            with self._render_lock:
+                self.render(force=True)
+                # 流式窗口已关时 render(force) 走的是整卡 PATCH；这里再强制刷一次，
+                # 保证「✅ 回合完成」状态行与最终正文一定落屏（不受 6s 节流限制）。
+                if self._stream_closed:
+                    self._flush_full_card(force=True)
             obj, code = _api("PATCH", f"/cardkit/v1/cards/{self.card_id}/settings",
                              {"settings": json.dumps({"config": {"streaming_mode": False}}),
                               "uuid": str(uuid.uuid4()), "sequence": self._next()})
