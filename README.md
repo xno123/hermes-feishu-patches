@@ -37,6 +37,7 @@ systemctl --user restart hermes-gateway.service       # 重启网关生效
 | **思考流展示** | **平滑固定视窗（防抖归档）** | `cardkit.py` | 超过 360 字符平滑向上收起，顶部固定单行提示 `<font color='grey'>▲ 早期思考已向上收起 · 正在最新推理…</font>`，高度恒定锁定，绝无跳行；收尾时 100% 完整全量归档入折叠面板。 |
 | **工具调用** | **高密度专业开发者排版** | `cardkit.py`<br>`run_turn_progress.py`<br>`cardkit_bridge.py` | 像素级对齐 Open-WebUI/DSH 风格：`<font color='blue'>●</font>  ✅ **`bash`** — `command``；参数全链路抓取透传；保持 `str` 继承向后兼容；折叠栏动态显示 `🔧 工具调用（共 N 次）`。 |
 | **稳定性** | **卡片渲染与模型流解耦（防卡死）** | `cardkit.py` | `push_*` 回调只更新状态立即返回，写卡由后台单一渲染线程合并执行（`_schedule_render`）；失败写入按尝试时刻节流，杜绝每秒上百次重试打爆文件描述符；`_render_lock` 串行化 finalize 收尾渲染。飞书接口再慢也堵不住模型流，修复「waiting for stream response」长时间卡死与 fd 耗尽（2026-11-19，详见 `docs/`）。 |
+| **话题体系** | **无锚点消息落话题修复** | `adapter.py`<br>`cardkit.py` | 飞书 `message.create` 不接受 `receive_id_type=thread_id`（必返 99992402），原「话题内兜底」分支实为死路：后台通知唤醒卡、重启通知等无锚点消息裸发主窗口或直接丢失。现改为 `ListMessage(container_id_type=thread)` 取话题内锚点后走 `reply + reply_in_thread`（与音频路径 99992402 retry 同款已验证模式），锚点取自 thread 容器故必然加入原话题、不派生新话题（2026-11-19，详见 `docs/`）。 |
 
 ---
 
@@ -109,6 +110,7 @@ systemctl --user restart hermes-gateway.service
 - `2026-11-08_飞书卡片配置生效与思考流优化.md`：卡片配置生效链路与思考流优化。
 - `2026-11-09_飞书卡片600秒流式上限与动态模型目录.md`：飞书 600 秒流式窗口实测探针、重开/降级策略、模型目录动态化。
 - `2026-11-19_飞书卡片卡流修复与模型流解耦.md`：py-spy 实锤的卡片渲染反向堵死模型流根因分析、两轮修复（后台渲染线程/失败节流/_render_lock）与回归验证。
+- `2026-11-19_通知唤醒回复落错话题修复.md`：无锚点消息（后台通知唤醒卡/重启通知）落主窗口的根因（`message.create` 不支持 `receive_id_type=thread_id` → 99992402 死分支）、ROUTE-DEBUG 探针定位过程、adapter+cardkit 两处改走 thread 锚点 reply_in_thread 的修复与验证。
 
 ## License
 

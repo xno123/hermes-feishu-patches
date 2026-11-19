@@ -312,7 +312,7 @@ index 5fbc2560ae..0972dcf419 100644
              return await self._on_edit_failure(result, text, finalize=finalize,
                                                 is_turn_final=is_turn_final)
 diff --git a/plugins/platforms/feishu/adapter.py b/plugins/platforms/feishu/adapter.py
-index 06d7bb4724..b9fff67db5 100644
+index 06d7bb4724..45194db88a 100644
 --- a/plugins/platforms/feishu/adapter.py
 +++ b/plugins/platforms/feishu/adapter.py
 @@ -325,6 +325,7 @@ class FeishuAdapterSettings:
@@ -499,12 +499,18 @@ index 06d7bb4724..b9fff67db5 100644
                  if thread_msg_id:
                      logger.info("[Feishu] Audio: retrying via reply API in thread")
                      message_response = await self._feishu_send_with_retry(
-@@ -3696,14 +3809,23 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
+@@ -3696,18 +3809,41 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
      async def _send_raw_message(
          self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
      ) -> Any:
 +        from plugins.platforms.feishu.feishu_thread_reply import send_threaded_reply, wants_thread_reply
          thread_id = (metadata or {}).get("thread_id")
++        # 豆花调试补丁 2026-11-19：定位通知唤醒回合的回复为何落到主窗口而非原话题。
++        logger.info(
++            "[Feishu] ROUTE-DEBUG send chat=%s thread_id=%r reply_to=%r meta_keys=%s cache_anchor=%r",
++            chat_id, thread_id, reply_to, sorted((metadata or {}).keys()),
++            getattr(self, "_last_inbound_message_id", {}).get((chat_id, thread_id or "")),
++        )
          effective_reply_to = reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None)
 -        if effective_reply_to:
 -            body = self._build_reply_message_body(
@@ -525,10 +531,26 @@ index 06d7bb4724..b9fff67db5 100644
              )
 -            request = self._build_reply_message_request(effective_reply_to, body)
 -            return await self._run_blocking(self._client.im.v1.message.reply, request)
-         if thread_id:
-             # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
-             receive_id, receive_id_type = thread_id, "thread_id"
-@@ -4399,6 +4521,16 @@ def interactive_setup() -> None:
+-        if thread_id:
+-            # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
+-            receive_id, receive_id_type = thread_id, "thread_id"
+-        elif chat_id.startswith("feishu_user_id:"):
++        # 豆花补丁 2026-11-19：原实现此处用 receive_id_type=thread_id 建消息落话题——
++        # 飞书 message.create 不接受该类型（实测 99992402 field validation failed，
++        # 与本文件音频路径的 99992402 retry 注释同因）。改为取话题内最后一条消息
++        # 当锚点走 reply_in_thread（与音频 retry 同款已验证模式）；取不到锚点才裸发。
++        if thread_id and wants_thread:
++            thread_anchor = await self._fetch_last_message_in_thread(thread_id)
++            if thread_anchor:
++                return await send_threaded_reply(
++                    self, chat_id=chat_id, msg_type=msg_type, payload=payload,
++                    reply_to=thread_anchor, metadata=metadata,
++                )
++        if chat_id.startswith("feishu_user_id:"):
+             receive_id, receive_id_type = chat_id.split(":", 1)[1], "user_id"
+         else:
+             receive_id, receive_id_type = chat_id, "open_id" if chat_id.startswith("ou_") else "chat_id"
+@@ -4399,6 +4535,16 @@ def interactive_setup() -> None:
      save_env_value("FEISHU_GROUP_POLICY", "open" if group_idx == 0 else "disabled")
      print_info("Group chats enabled (bot must be @mentioned)." if group_idx == 0 else "Group chats disabled.")
  
@@ -1114,10 +1136,10 @@ index bf7fe58091..bbf530a188 100644
 +                "view_provider": provider, "session_key": session_key})
 diff --git a/plugins/platforms/feishu/cardkit.py b/plugins/platforms/feishu/cardkit.py
 new file mode 100644
-index 0000000000..32786e0c57
+index 0000000000..47321e2444
 --- /dev/null
 +++ b/plugins/platforms/feishu/cardkit.py
-@@ -0,0 +1,1197 @@
+@@ -0,0 +1,1217 @@
 +"""Feishu CardKit 2.0 streaming transport (豆花本机扩展, 2026-11-06).
 +
 +Turns ONE Feishu assistant turn into ONE live 2.0 card:
@@ -1612,6 +1634,26 @@ index 0000000000..32786e0c57
 +                    sent = True
 +                else:
 +                    self.last_error = f"reply code={robj.get('code')} http={rcode}; fallback to create"
++            if not sent and self.thread_id:
++                # 豆花补丁 2026-11-19 v2：飞书 message.create 不接受 receive_id_type=thread_id
++                # （实测必返 99992402 field validation failed；adapter 音频路径早有同款结论与
++                # retry 注释）。落进已有话题的唯一合法方式：从话题里取一条消息当锚点走
++                # reply + reply_in_thread——锚点取自 thread 容器，必然加入原话题而非新建。
++                tobj, _tcode = _api("GET", "/im/v1/messages", None,
++                                    params={"container_id_type": "thread",
++                                            "container_id": self.thread_id, "page_size": 1})
++                titems = ((tobj.get("data") or {}).get("items") or []) if tobj.get("code") == 0 else []
++                anchor = titems[0].get("message_id") if titems else None
++                if anchor:
++                    robj, rcode = _api("POST", f"/im/v1/messages/{anchor}/reply",
++                                       {"msg_type": "interactive", "content": content,
++                                        "reply_in_thread": True})
++                    if robj.get("code") == 0 and (robj.get("data") or {}).get("message_id"):
++                        self.message_id = robj["data"]["message_id"]
++                        sent = True
++                    else:
++                        self.last_error = (f"thread-anchor reply code={robj.get('code')} "
++                                           f"http={rcode}; fallback to create")
 +            if not sent:
 +                sobj, scode = _api("POST", "/im/v1/messages",
 +                                   {"receive_id": self.chat_id, "msg_type": "interactive",

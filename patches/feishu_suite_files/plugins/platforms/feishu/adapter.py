@@ -3811,6 +3811,12 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
     ) -> Any:
         from plugins.platforms.feishu.feishu_thread_reply import send_threaded_reply, wants_thread_reply
         thread_id = (metadata or {}).get("thread_id")
+        # 豆花调试补丁 2026-11-19：定位通知唤醒回合的回复为何落到主窗口而非原话题。
+        logger.info(
+            "[Feishu] ROUTE-DEBUG send chat=%s thread_id=%r reply_to=%r meta_keys=%s cache_anchor=%r",
+            chat_id, thread_id, reply_to, sorted((metadata or {}).keys()),
+            getattr(self, "_last_inbound_message_id", {}).get((chat_id, thread_id or "")),
+        )
         effective_reply_to = reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None)
         # 豆花补丁：DM 主框消息无 reply_to 时，用缓存的入站 message_id 作锚点建话题
         # 2026-11-08 修：若 metadata 明确要求 thread_reply=False（如 /new 配置卡），绝不自动锚定建话题！
@@ -3826,10 +3832,18 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
                 self, chat_id=chat_id, msg_type=msg_type, payload=payload,
                 reply_to=effective_reply_to, metadata=metadata,
             )
-        if thread_id:
-            # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
-            receive_id, receive_id_type = thread_id, "thread_id"
-        elif chat_id.startswith("feishu_user_id:"):
+        # 豆花补丁 2026-11-19：原实现此处用 receive_id_type=thread_id 建消息落话题——
+        # 飞书 message.create 不接受该类型（实测 99992402 field validation failed，
+        # 与本文件音频路径的 99992402 retry 注释同因）。改为取话题内最后一条消息
+        # 当锚点走 reply_in_thread（与音频 retry 同款已验证模式）；取不到锚点才裸发。
+        if thread_id and wants_thread:
+            thread_anchor = await self._fetch_last_message_in_thread(thread_id)
+            if thread_anchor:
+                return await send_threaded_reply(
+                    self, chat_id=chat_id, msg_type=msg_type, payload=payload,
+                    reply_to=thread_anchor, metadata=metadata,
+                )
+        if chat_id.startswith("feishu_user_id:"):
             receive_id, receive_id_type = chat_id.split(":", 1)[1], "user_id"
         else:
             receive_id, receive_id_type = chat_id, "open_id" if chat_id.startswith("ou_") else "chat_id"

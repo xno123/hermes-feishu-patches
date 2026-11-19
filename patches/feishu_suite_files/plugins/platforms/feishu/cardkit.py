@@ -492,6 +492,26 @@ class CardKitStream:
                     sent = True
                 else:
                     self.last_error = f"reply code={robj.get('code')} http={rcode}; fallback to create"
+            if not sent and self.thread_id:
+                # 豆花补丁 2026-11-19 v2：飞书 message.create 不接受 receive_id_type=thread_id
+                # （实测必返 99992402 field validation failed；adapter 音频路径早有同款结论与
+                # retry 注释）。落进已有话题的唯一合法方式：从话题里取一条消息当锚点走
+                # reply + reply_in_thread——锚点取自 thread 容器，必然加入原话题而非新建。
+                tobj, _tcode = _api("GET", "/im/v1/messages", None,
+                                    params={"container_id_type": "thread",
+                                            "container_id": self.thread_id, "page_size": 1})
+                titems = ((tobj.get("data") or {}).get("items") or []) if tobj.get("code") == 0 else []
+                anchor = titems[0].get("message_id") if titems else None
+                if anchor:
+                    robj, rcode = _api("POST", f"/im/v1/messages/{anchor}/reply",
+                                       {"msg_type": "interactive", "content": content,
+                                        "reply_in_thread": True})
+                    if robj.get("code") == 0 and (robj.get("data") or {}).get("message_id"):
+                        self.message_id = robj["data"]["message_id"]
+                        sent = True
+                    else:
+                        self.last_error = (f"thread-anchor reply code={robj.get('code')} "
+                                           f"http={rcode}; fallback to create")
             if not sent:
                 sobj, scode = _api("POST", "/im/v1/messages",
                                    {"receive_id": self.chat_id, "msg_type": "interactive",
